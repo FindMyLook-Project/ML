@@ -16,12 +16,18 @@ print(f"Using device: {device}")
 
 yolo_model = YOLO('yolov8n.pt') 
 clip_model, preprocess = clip.load("ViT-B/32", device=device)
+ENABLE_TEMP_DETECTION_LOGS = False
+DETECTION_CONFIDENCE_THRESHOLD = 0.5
+ALLOWED_DETECTION_LABELS = {"person"}
+MIN_DETECTION_BOX_AREA = 18000.0
+KEEP_ONLY_TOP_DETECTION = True
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
 CATEGORY_MAPPING = {
+    "person": "look",
     "shirt": "top", "t-shirt": "top", "jacket": "top", "coat": "top", "sweater": "top", "dress": "top",
     "pants": "bottom", "jeans": "bottom", "shorts": "bottom", "skirt": "bottom",
     "sneakers": "shoes", "boots": "shoes"
@@ -56,6 +62,8 @@ def process_image_logic(img):
     found_items = []
     
     if len(results[0].boxes) == 0:
+        if ENABLE_TEMP_DETECTION_LOGS:
+            print("[ML DEBUG] no detections from YOLO, fallback to full-image embedding")
         image_input = preprocess(img).unsqueeze(0).to(device)
         with torch.no_grad():
             image_features = clip_model.encode_image(image_input)
@@ -63,29 +71,62 @@ def process_image_logic(img):
             embedding = image_features.cpu().numpy().flatten().tolist()
             
         color = get_fashion_color(img)
-        found_items.append({"category": "other", "confidence": 1.0, "embedding": embedding, "color": color})
+        found_items.append({"category": "other", "confidence": 0.3, "embedding": embedding, "color": color})
     else:
+        candidate_boxes = []
         for r in results:
             for box in r.boxes:
                 label = yolo_model.names[int(box.cls)]
                 conf = float(box.conf)
-                if conf > 0.2:
-                    coords = box.xyxy[0].tolist()
-                    crop_img = img.crop((coords[0], coords[1], coords[2], coords[3]))
-                    image_input = preprocess(crop_img).unsqueeze(0).to(device)
-                    with torch.no_grad():
-                        image_features = clip_model.encode_image(image_input)
-                        image_features /= image_features.norm(dim=-1, keepdim=True)
-                        embedding = image_features.cpu().numpy().flatten().tolist()
-                    
-                    color = get_fashion_color(crop_img)
-                    
-                    found_items.append({
-                        "category": get_category_group(label),
-                        "confidence": conf,
-                        "embedding": embedding,
-                        "color": color 
-                    })
+                mapped_category = get_category_group(label)
+                coords = box.xyxy[0].tolist()
+                width = max(0.0, float(coords[2] - coords[0]))
+                height = max(0.0, float(coords[3] - coords[1]))
+                area = width * height
+                is_allowed_label = label in ALLOWED_DETECTION_LABELS
+                passes_confidence = conf > DETECTION_CONFIDENCE_THRESHOLD
+                passes_area = area >= MIN_DETECTION_BOX_AREA
+                passes_filters = is_allowed_label and passes_confidence and passes_area
+
+                if ENABLE_TEMP_DETECTION_LOGS:
+                    print(
+                        "[ML DEBUG] "
+                        f"label={label}, mapped={mapped_category}, conf={conf:.4f}, "
+                        f"box=({coords[0]:.1f},{coords[1]:.1f},{coords[2]:.1f},{coords[3]:.1f}), "
+                        f"size=({width:.1f}x{height:.1f}), area={area:.1f}, "
+                        f"allowed_label={is_allowed_label}, passes_conf={passes_confidence}, "
+                        f"passes_area={passes_area}, passes_filters={passes_filters}"
+                    )
+
+                if passes_filters:
+                    selection_score = conf * area
+                    candidate_boxes.append((selection_score, conf, mapped_category, coords))
+
+        if KEEP_ONLY_TOP_DETECTION and candidate_boxes:
+            best_candidate = max(candidate_boxes, key=lambda x: x[0])
+            candidate_boxes = [best_candidate]
+            if ENABLE_TEMP_DETECTION_LOGS:
+                print(
+                    "[ML DEBUG] "
+                    f"selected_top_box score={best_candidate[0]:.2f}, conf={best_candidate[1]:.4f}"
+                )
+
+        for _, conf, mapped_category, coords in candidate_boxes:
+            crop_img = img.crop((coords[0], coords[1], coords[2], coords[3]))
+            image_input = preprocess(crop_img).unsqueeze(0).to(device)
+            with torch.no_grad():
+                image_features = clip_model.encode_image(image_input)
+                image_features /= image_features.norm(dim=-1, keepdim=True)
+                embedding = image_features.cpu().numpy().flatten().tolist()
+
+            color = get_fashion_color(crop_img)
+
+            found_items.append({
+                "category": mapped_category,
+                "confidence": conf,
+                "embedding": embedding,
+                "color": color
+            })
     return found_items
 
 class URLRequest(BaseModel):

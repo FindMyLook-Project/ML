@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+ultralytics
+sentence-transformers
+Pillow
+python-multipart
+transformers
+git+https://github.com/openai/CLIP.git

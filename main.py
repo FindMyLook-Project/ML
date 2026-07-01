@@ -644,22 +644,6 @@ def get_fashion_color(pil_img, category_group=None):
     garment_brightness = garment_pixels.mean(axis=1)
     brightness_std = float(garment_brightness.std())
 
-    if category_group == "top" and brightness_std > 24:
-        # Stripe check MUST run before bright-white: a navy+white stripe shirt has
-        # ~50% bright (white stripe) pixels that would fool _try_bright_white_top.
-        stripe_hit = _try_stripe_color(garment_pixels, garment_brightness, brightness_std, category_group)
-        if stripe_hit:
-            return stripe_hit
-        white_hit = _try_bright_white_top(garment_pixels, garment_brightness)
-        if white_hit:
-            return white_hit
-        white_hit = _try_solid_white_top(garment_pixels, garment_brightness)
-        if white_hit:
-            return white_hit
-        beige_hit = _try_warm_beige_top(garment_pixels, garment_brightness)
-        if beige_hit:
-            return beige_hit
-
     if category_group == "skirt":
         dark_frac = float((garment_brightness < 85).sum()) / max(len(garment_brightness), 1)
         bright_frac = float((garment_brightness > 175).sum()) / max(len(garment_brightness), 1)
@@ -744,44 +728,30 @@ def get_fashion_color(pil_img, category_group=None):
             if wr >= wg >= wb and (wr - wb) >= 6 and 85 <= warm_avg <= 210 and warm_sat < 70:
                 print(f"🎨 Detected color: beige (warm-shoe rule)  warm_avg={warm_avg:.0f}")
                 return "beige", False
-    # Light-wash denim shirts — bright desaturated blue, not white or grey neutrals.
+    # ── Top colour pipeline (single ordered pass) ─────────────────────────────
     if category_group == "top":
+        # 1. Stripe — must precede bright-white: white stripe pixels fool _try_bright_white_top.
+        if brightness_std > 24:
+            stripe_hit = _try_stripe_color(garment_pixels, garment_brightness, brightness_std, category_group)
+            if stripe_hit:
+                return stripe_hit
+        # 2. Solid white and mixed-crop white
+        white_hit = _try_bright_white_top(garment_pixels, garment_brightness)
+        if white_hit:
+            return white_hit
+        white_hit = _try_solid_white_top(garment_pixels, garment_brightness)
+        if white_hit:
+            return white_hit
+        # 3. Warm beige / taupe
+        beige_hit = _try_warm_beige_top(garment_pixels, garment_brightness)
+        if beige_hit:
+            return beige_hit
+        # 4. Light-wash denim / chambray
         avg_sat = float(max(r, g, b) - min(r, g, b))
         if 130 <= avg_brightness <= 235 and avg_sat >= 10 and b >= r + 8 and b >= g - 8:
             print(f"🎨 Detected color: light_blue (denim-top rule)  avg_rgb=({r:.0f},{g:.0f},{b:.0f})")
             return "light_blue", False
-    # White crop tops outdoors — bright shirt pixels even when the zone average is grey.
-    if category_group == "top":
-        bright_frac = float((garment_brightness > 175).sum()) / max(len(garment_brightness), 1)
-        dark_frac_top = float((garment_brightness < 80).sum()) / max(len(garment_brightness), 1)
-        white_hit = _try_bright_white_top(garment_pixels, garment_brightness)
-        if white_hit:
-            return white_hit
-        if bright_frac >= 0.12 and _is_simple_horizontal_stripe(garment_pixels, garment_brightness):
-            stripe = _classify_stripe_dark_pixels(garment_pixels, garment_brightness)
-            if stripe:
-                color, is_stripe = stripe
-                print(f"🎨 Detected color: {color} (top-stripe-before-white rule)")
-                return color, is_stripe
-        white_hit = _try_solid_white_top(garment_pixels, garment_brightness)
-        if white_hit:
-            return white_hit
-        beige_hit = _try_warm_beige_top(garment_pixels, garment_brightness)
-        if beige_hit:
-            return beige_hit
-        # Very high bright fraction with almost no dark pixels often means background bleed, not a solid white tee.
-        if bright_frac >= 0.85 and brightness_std < 20:
-            pass
-        elif bright_frac >= 0.07 and dark_frac_top < 0.04 and brightness_std < 28:
-            bright_px = garment_pixels[garment_brightness > 175]
-            br, bg, bb = bright_px.mean(axis=0)
-            bright_sat = max(br, bg, bb) - min(br, bg, bb)
-            neutral = abs(br - bg) < 12 and abs(bg - bb) < 12
-            if neutral and bright_sat < 35:
-                print(f"🎨 Detected color: white (bright-fraction-top rule)  bright_frac={bright_frac:.2f}")
-                return "white", False
-    # Pastel purple/lavender tees read as white in bright outdoor light — check after white rules.
-    if category_group == "top":
+        # 5. Lavender / dusty purple
         purple_px = garment_pixels[
             (garment_pixels[:, 2] >= garment_pixels[:, 0])
             & (garment_brightness > 115)
@@ -793,33 +763,45 @@ def get_fashion_color(pil_img, category_group=None):
             if pb >= pr + 12 and purple_sat >= 18 and purple_sat < 55:
                 print(f"🎨 Detected color: lavender (purple-top rule)  avg_rgb=({pr:.0f},{pg:.0f},{pb:.0f})")
                 return "lavender", False
-    # White tee tucked into dark jeans — top zone mixes shirt + waist; use bright pixels.
-    if category_group == "top" and brightness_std > 35:
-        stripe_hit = _try_stripe_color(garment_pixels, garment_brightness, brightness_std, category_group)
-        if stripe_hit:
-            return stripe_hit
-        white_hit = _try_bright_white_top(garment_pixels, garment_brightness)
-        if white_hit:
-            return white_hit
-        bright_garment = garment_pixels[garment_brightness > 170]
-        dark_garment = garment_pixels[garment_brightness < 90]
-        if (
-            len(bright_garment) >= max(25, int(len(garment_pixels) * 0.15))
-            and len(bright_garment) > len(dark_garment)
-        ):
-            br, bg, bb = bright_garment.mean(axis=0)
-            bright_avg = (float(br) + float(bg) + float(bb)) / 3.0
-            bright_sat = max(br, bg, bb) - min(br, bg, bb)
-            neutral = abs(br - bg) < 12 and abs(bg - bb) < 12
-            white_hit = _try_bright_white_top(bright_garment, bright_garment.mean(axis=1))
-            if white_hit:
-                return white_hit
-            beige_hit = _try_warm_beige_top(bright_garment, bright_garment.mean(axis=1))
-            if beige_hit:
-                return beige_hit
-            if bright_avg > 168 and bright_sat < 45 and neutral and bright_avg >= 218:
-                print(f"🎨 Detected color: white (bright-top rule)  bright_avg={bright_avg:.0f}")
-                return "white", False
+        # 6. Mixed-crop fallback — white or beige tee tucked into dark jeans.
+        # The full-crop average is dragged dark by pants pixels. Re-score only the
+        # bright-pixel cluster (the shirt) to retrieve the actual garment colour.
+        if brightness_std > 35:
+            bright_garment = garment_pixels[garment_brightness > 170]
+            dark_garment = garment_pixels[garment_brightness < 90]
+            if (
+                len(bright_garment) >= max(25, int(len(garment_pixels) * 0.15))
+                and len(bright_garment) > len(dark_garment)
+            ):
+                white_hit = _try_bright_white_top(bright_garment, bright_garment.mean(axis=1))
+                if white_hit:
+                    return white_hit
+                beige_hit = _try_warm_beige_top(bright_garment, bright_garment.mean(axis=1))
+                if beige_hit:
+                    return beige_hit
+                br, bg, bb = bright_garment.mean(axis=0)
+                bright_avg = (float(br) + float(bg) + float(bb)) / 3.0
+                bright_sat = max(br, bg, bb) - min(br, bg, bb)
+                neutral = abs(br - bg) < 12 and abs(bg - bb) < 12
+                if bright_avg > 168 and bright_sat < 45 and neutral and bright_avg >= 218:
+                    print(f"🎨 Detected color: white (bright-top rule)  bright_avg={bright_avg:.0f}")
+                    return "white", False
+        # 7. Bright-fraction last resort — covers low-variance crops where
+        # _try_bright_white_top (22% threshold) doesn't fire but the garment
+        # is clearly mostly bright and neutral (e.g. overexposed/studio white top).
+        bright_frac = float((garment_brightness > 175).sum()) / max(len(garment_brightness), 1)
+        dark_frac_top = float((garment_brightness < 80).sum()) / max(len(garment_brightness), 1)
+        if bright_frac >= 0.85 and brightness_std < 20:
+            pass  # background bleed, not a white garment
+        elif bright_frac >= 0.07 and dark_frac_top < 0.04 and brightness_std < 28:
+            bright_px = garment_pixels[garment_brightness > 175]
+            if len(bright_px) >= 20:
+                br, bg, bb = bright_px.mean(axis=0)
+                bright_sat = max(br, bg, bb) - min(br, bg, bb)
+                neutral = abs(br - bg) < 12 and abs(bg - bb) < 12
+                if neutral and bright_sat < 35:
+                    print(f"🎨 Detected color: white (bright-fraction-top rule)  bright_frac={bright_frac:.2f}")
+                    return "white", False
     # White shorts/skirts with a dark belt: bright garment pixels dominate — use them, not belt.
     if category_group in ("bottom", "skirt") and brightness_std > 45:
         bright_garment = garment_pixels[garment_brightness > 165]

@@ -1582,8 +1582,12 @@ def detect_bottom_length_clip(pil_img) -> str:
     return best_length
 
 
-def detect_skirt_length_clip(pil_img) -> str:
-    """Classify skirt length: mini vs midi vs maxi."""
+def detect_skirt_length_clip(pil_img) -> tuple:
+    """Classify skirt length: mini vs midi vs maxi.
+
+    Returns (best_length: str, scores: dict) so callers can inspect raw scores
+    for confidence-gated upgrade logic.
+    """
     image_features = _encode_image(pil_img)
     best_length = "midi"
     best_score = -1.0
@@ -1604,7 +1608,7 @@ def detect_skirt_length_clip(pil_img) -> str:
         best_length = "maxi"
     rounded = {k: round(v, 3) for k, v in sorted(scores.items(), key=lambda x: -x[1])}
     print(f"Skirt length: {best_length}  scores: {rounded}")
-    return best_length
+    return best_length, scores
 
 
 SKIRT_LENGTH_COLOR_PHRASES = {
@@ -2293,6 +2297,7 @@ def _analyze_garment_crop(
     yolo_label: Optional[str] = None,
     yolo_conf: float = 0.0,
     force_category: Optional[str] = None,
+    length_hint_img: Optional[Image.Image] = None,
 ) -> Optional[dict]:
     """Run full CLIP pipeline on one crop and return a Total Look item dict."""
     category_group = force_category or detect_category_clip(crop_img)
@@ -2382,7 +2387,22 @@ def _analyze_garment_crop(
     elif category_group == "top" and fabric == "leather":
         top_style = "coat"
     bottom_length = detect_bottom_length_clip(crop_img) if category_group == "bottom" else None
-    skirt_length = detect_skirt_length_clip(crop_img) if category_group == "skirt" else None
+    if category_group == "skirt":
+        skirt_length, _ = detect_skirt_length_clip(crop_img)
+        # When the standard zone crop (44-76%) says "mini", verify against a taller
+        # crop (44-95%) that captures the full garment length.  Only upgrade if the
+        # longer-length label beats mini by ≥ 0.012 on the taller crop — this rules
+        # out false upgrades caused by boots/bare-legs below a real mini skirt.
+        if skirt_length == "mini" and length_hint_img is not None:
+            tall_length, tall_scores = detect_skirt_length_clip(length_hint_img)
+            if tall_length in ("midi", "maxi"):
+                mini_s = tall_scores.get("mini", 0)
+                tall_s = tall_scores.get(tall_length, 0)
+                if tall_s >= mini_s + 0.012:
+                    print(f"📐 Skirt length upgraded: mini → {tall_length} (tall-crop margin={tall_s - mini_s:.3f})")
+                    skirt_length = tall_length
+    else:
+        skirt_length = None
     if category_group == "skirt" and color == "grey":
         midi_s = maxi_s = 0.0
         image_features = _encode_image(crop_img)
@@ -2607,8 +2627,22 @@ def _zone_garment_candidates(img: Image.Image, region: Optional[tuple] = None) -
         forced = _resolve_zone_force_category(zone_name, scores, crop)
         if not forced:
             continue
+        # For the bottom/skirt zone, pass a taller crop (44%→95%) as a length
+        # hint so detect_skirt_length_clip sees the full length of long skirts.
+        # The standard zone crop stops at 76%, cutting off ankle-length skirts
+        # and causing them to be mis-labelled as mini.
+        length_hint = None
+        if zone_name == "bottom":
+            tall_bbox = [
+                int(rx0 + rw * 0.05),
+                int(ry0 + rh * 0.44),
+                int(rx0 + rw * 0.95),
+                int(ry0 + rh * 0.95),
+            ]
+            length_hint = img.crop(tuple(tall_bbox))
         item = _analyze_garment_crop(
             crop, bbox, f"zone-{zone_name}", force_category=forced,
+            length_hint_img=length_hint,
         )
         if item and item["slotId"] in allowed_slots:
             candidates.append(item)

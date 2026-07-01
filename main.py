@@ -19,6 +19,33 @@ _IGNORED_YOLO_CLASSES = {
     "person", "backpack", "handbag", "tie", "umbrella", "suitcase",
 }
 
+# Accessory classes whose pixels contaminate garment zone colour analysis
+_BAG_YOLO_CLASSES = {"handbag", "backpack", "suitcase"}
+
+
+def _paint_out_boxes(
+    img: Image.Image,
+    boxes: list,
+    fill: tuple = (245, 245, 245),
+) -> Image.Image:
+    """Return a copy of *img* with each bounding box filled with *fill*.
+
+    The default fill (245, 245, 245) is above the background-masking threshold
+    used in get_fashion_color (R>235 & G>235 & B>230), so painted pixels are
+    automatically excluded from garment pixel statistics — they vanish as
+    "bright background" and never inflate dark_frac or brightness_std.
+    """
+    if not boxes:
+        return img
+    arr = np.array(img.convert("RGB"), dtype=np.uint8).copy()
+    ih, iw = arr.shape[:2]
+    for x0, y0, x1, y1 in boxes:
+        x0, y0 = max(0, int(x0)), max(0, int(y0))
+        x1, y1 = min(iw, int(x1)), min(ih, int(y1))
+        if x1 > x0 and y1 > y0:
+            arr[y0:y1, x0:x1] = fill
+    return Image.fromarray(arr)
+
 # Portrait zone crops when YOLO misses individual garments (y0/y1 as fraction of height)
 # Keep zones non-overlapping — a wide top zone pulls in belt/waist and misreads shirt colour.
 _TOTAL_LOOK_ZONES = [
@@ -239,19 +266,23 @@ CLIP_BOTTOM_LENGTH_PROMPTS = {
 
 CLIP_SKIRT_LENGTH_PROMPTS = {
     "mini": [
-        "black high waisted mini skirt above the knee with front patch pockets",
-        "short black mini skirt mid thigh length on a model",
-        "structured black mini skirt with belt loops above the knee",
+        "high waisted mini skirt above the knee with front patch pockets",
+        "short mini skirt mid thigh length on a model",
+        "structured mini skirt with belt loops well above the knee",
+        "denim mini skirt exposing most of the thigh",
     ],
     "midi": [
-        "black pleated midi skirt below the knee on a model",
+        "pleated midi skirt ending below the knee on a model",
         "knee length A-line midi skirt on a model",
-        "asymmetric hem black midi skirt below the knee",
+        "midi skirt that falls between the knee and ankle",
+        "asymmetric hem midi skirt below the knee",
     ],
     "maxi": [
-        "long black maxi skirt floor length on a model",
-        "flowing black maxi skirt reaching the ankles",
-        "black satin maxi skirt with side slit full length",
+        "long maxi skirt reaching the floor on a model",
+        "flowing maxi skirt covering the ankles and feet",
+        "full length maxi skirt touching the ground",
+        "satin maxi skirt with side slit floor length",
+        "a skirt that goes all the way to the ankles",
     ],
 }
 
@@ -315,8 +346,20 @@ def _encode_image(pil_img: Image.Image) -> torch.Tensor:
 # Multiple prompts per color → averaged into one strong color centroid.
 COLOR_TEXT_PROMPTS = {
     "black":      ["a black top", "a solid black t-shirt", "black clothing item", "a dark black garment on white background"],
-    "white":      ["a white top", "a pure white t-shirt", "white clothing item", "a bright white garment on white background"],
-    "beige":      ["a beige top", "a cream colored t-shirt", "beige neutral clothing", "a sand-colored garment"],
+    # White prompts: neutral, crisp, cool — no warm tones, no sandy hue.
+    "white":      [
+        "a crisp bright white cotton t-shirt on a model",
+        "a solid white tee shirt with pure neutral cool white color",
+        "a plain white garment with no warm yellow or beige tones",
+        "a bright white blouse with neutral pure white hue",
+    ],
+    # Beige prompts: warm, sandy, taupe — earthy undertone distinguishes from crisp white.
+    "beige":      [
+        "a warm sandy beige cotton t-shirt with earthy warm hue",
+        "an earthy taupe outdoor shirt with warm khaki sandy tone",
+        "a soft sand-colored top with warm caramel neutral undertone",
+        "an outdoor linen shirt in warm beige with yellowish warm cast",
+    ],
     "grey":       ["a grey top", "a gray t-shirt", "grey clothing item", "a charcoal grey garment"],
     "navy":       ["a navy blue top", "a dark navy t-shirt", "navy blue clothing", "a deep navy colored garment"],
     "red":        ["a red top", "a bright red t-shirt", "red clothing item", "a vivid red garment"],
@@ -383,6 +426,42 @@ for _fab, _texts in CLIP_FABRIC_PROMPTS.items():
     _centroid = _centroid / _centroid.norm(dim=-1, keepdim=True)
     _fabric_text_features[_fab] = _centroid
 
+# ── Solid-vs-pattern CLIP tiebreaker ─────────────────────────────────────────
+# Pixel-based pattern rules fail when dots/motifs are smaller than ~2 pixels in
+# the 100x100 resize (< 1% dark coverage → brightness_std < 20).  CLIP operates
+# at full resolution and reliably distinguishes solid from printed garments.
+CLIP_SOLID_VS_PATTERN_PROMPTS = {
+    "solid": [
+        "a plain solid white garment with no print or pattern, clean uniform color",
+        "a smooth solid colored skirt or top, no design, no motif",
+    ],
+    "pattern": [
+        "a white garment with black polka dots printed on the fabric",
+        "a light colored skirt or top with dark polka dots or printed pattern",
+        "a white fabric with repeating printed motifs, dots, or floral design",
+    ],
+}
+_solid_pattern_features: dict = {}
+for _key, _texts in CLIP_SOLID_VS_PATTERN_PROMPTS.items():
+    _feats = _encode_texts(_texts)
+    _centroid = _feats.mean(dim=0, keepdim=True)
+    _centroid = _centroid / _centroid.norm(dim=-1, keepdim=True)
+    _solid_pattern_features[_key] = _centroid
+
+
+def _clip_is_patterned(pil_img: Image.Image, margin: float = 0.010) -> bool:
+    """Return True when CLIP scores 'patterned' > 'solid' by at least `margin`.
+
+    Used as a last-resort gate before returning 'white' for garments whose
+    polka-dot or print is too small to register in the 100×100 pixel analysis.
+    """
+    image_features = _encode_image(pil_img)
+    pattern_score = float((image_features @ _solid_pattern_features["pattern"].T).squeeze(0).max())
+    solid_score   = float((image_features @ _solid_pattern_features["solid"].T).squeeze(0).max())
+    print(f"🔍 Solid-vs-pattern CLIP: pattern={pattern_score:.3f}, solid={solid_score:.3f}")
+    return pattern_score >= solid_score + margin
+
+
 # Template used to build a combined color+fabric re-ranking prompt.
 # Category-specific: "lavender linen trousers" on a shirt crop boosts pants in results.
 FABRIC_COLOR_TEMPLATES_BOTTOM = {
@@ -430,7 +509,9 @@ def _classify_stripe_dark_pixels(garment_pixels, garment_brightness) -> Optional
         if r >= g - 6 and (r - b) >= 16 and g >= b + 6:
             continue
         if avg_brightness < 60 and b > r + 5:
-            if (b - r) < 12 and abs(r - g) < 15:
+            # Only call it black if the blue dominance is very weak (washed-out dark pixel,
+            # not true navy). A real navy stripe has b-r >= 8.
+            if (b - r) < 8 and abs(r - g) < 12:
                 return "black", True
             return "navy", True
         return "black", True
@@ -599,11 +680,15 @@ def get_fashion_color(pil_img, category_group=None):
         is_grey_bg   = (saturation < 15) & (brightness > 225)
         is_sky = np.zeros(len(pixels), dtype=bool)
     # Layer 3: skin tones
+    # For tops, use a tighter brightness cap (< 185 instead of < 210) so that
+    # bright warm-toned fabrics (pale yellow, cream, apricot at brightness 185-210)
+    # are NOT removed as skin.  Actual skin sits at 90-180; fabric highlights at 185+.
+    _skin_bright_cap = 185 if category_group == "top" else 210
     is_skin = (
         (pixels[:, 0] > 100) &
         (pixels[:, 0] > pixels[:, 2]) &
         (pixels[:, 0] - pixels[:, 2] > 30) &
-        (brightness > 90) & (brightness < 210)
+        (brightness > 90) & (brightness < _skin_bright_cap)
     )
     # Shoe crops often include bright floor tiles — drop them before averaging.
     if category_group == "shoes":
@@ -638,20 +723,6 @@ def get_fashion_color(pil_img, category_group=None):
     garment_brightness = garment_pixels.mean(axis=1)
     brightness_std = float(garment_brightness.std())
 
-    if category_group == "top" and brightness_std > 24:
-        white_hit = _try_bright_white_top(garment_pixels, garment_brightness)
-        if white_hit:
-            return white_hit
-        stripe_hit = _try_stripe_color(garment_pixels, garment_brightness, brightness_std, category_group)
-        if stripe_hit:
-            return stripe_hit
-        white_hit = _try_solid_white_top(garment_pixels, garment_brightness)
-        if white_hit:
-            return white_hit
-        beige_hit = _try_warm_beige_top(garment_pixels, garment_brightness)
-        if beige_hit:
-            return beige_hit
-
     if category_group == "skirt":
         dark_frac = float((garment_brightness < 85).sum()) / max(len(garment_brightness), 1)
         bright_frac = float((garment_brightness > 175).sum()) / max(len(garment_brightness), 1)
@@ -675,6 +746,13 @@ def get_fashion_color(pil_img, category_group=None):
         if bright_frac >= 0.20 and dark_frac >= 0.05 and brightness_std > 12:
             print(f"🎨 Detected color: pattern (polka/print skirt)  bright={bright_frac:.2f}, dark={dark_frac:.2f}")
             return "pattern", False
+        # Sparse polka-dots / small print on a light skirt (2–4% dark coverage).
+        # Dark-fraction falls below the 0.05 threshold above but brightness std is
+        # still elevated and the fabric is predominantly bright — must fire before
+        # the grey rule below which would otherwise win on the same pixel stats.
+        if brightness_std > 22 and avg_brightness > 175 and dark_frac >= 0.02 and bright_frac >= 0.45:
+            print(f"🎨 Detected color: pattern (sparse-dot skirt)  std={brightness_std:.1f}, dark={dark_frac:.2f}")
+            return "pattern", False
         if skirt_avg_sat < 25 and 115 <= avg_brightness <= 210 and dark_frac < 0.12:
             print(f"🎨 Detected color: grey (solid-skirt rule)  avg_rgb=({r:.0f},{g:.0f},{b:.0f})")
             return "grey", False
@@ -693,11 +771,25 @@ def get_fashion_color(pil_img, category_group=None):
             return "white", False
 
     if category_group == "shoes":
+        # ── Dark-strap priority check (must run BEFORE warm check) ────────────
+        # When skin (warm) dominates the foot zone the warm-strap rule would
+        # mis-classify dark-strapped shoes (black flip-flops, black sandals) as
+        # "beige". A visible dark strap/sole (≥ 3 % of garment pixels, avg < 68)
+        # is a stronger signal than warm foot skin → return "black" first.
+        dark_strap_px = garment_pixels[garment_brightness < 75]
+        dark_strap_frac = float(len(dark_strap_px)) / max(len(garment_pixels), 1)
+        if dark_strap_frac >= 0.030 and len(dark_strap_px) >= 10:
+            dr, dg, db = dark_strap_px.mean(axis=0)
+            if (float(dr) + float(dg) + float(db)) / 3.0 < 68:
+                print(f"🎨 Detected color: black (dark-strap-priority rule)  dark_frac={dark_strap_frac:.3f}")
+                return "black", False
+
+        # Warm strap / sole rule (tan, beige, brown flip-flops)
         warm_hit = _try_warm_shoe_strap_color(garment_pixels, garment_brightness)
         if warm_hit:
             return warm_hit
+
         dark_frac = float((garment_brightness < 80).sum()) / max(len(garment_brightness), 1)
-        dark_strap_px = garment_pixels[garment_brightness < 75]
         warm_strap_px = garment_pixels[
             (garment_brightness >= 88)
             & (garment_brightness <= 220)
@@ -736,44 +828,41 @@ def get_fashion_color(pil_img, category_group=None):
             if wr >= wg >= wb and (wr - wb) >= 6 and 85 <= warm_avg <= 210 and warm_sat < 70:
                 print(f"🎨 Detected color: beige (warm-shoe rule)  warm_avg={warm_avg:.0f}")
                 return "beige", False
-    # Light-wash denim shirts — bright desaturated blue, not white or grey neutrals.
+    # ── Top colour pipeline (single ordered pass) ─────────────────────────────
     if category_group == "top":
-        avg_sat = float(max(r, g, b) - min(r, g, b))
-        if 130 <= avg_brightness <= 235 and avg_sat >= 10 and b >= r + 8 and b >= g - 8:
-            print(f"🎨 Detected color: light_blue (denim-top rule)  avg_rgb=({r:.0f},{g:.0f},{b:.0f})")
-            return "light_blue", False
-    # White crop tops outdoors — bright shirt pixels even when the zone average is grey.
-    if category_group == "top":
-        bright_frac = float((garment_brightness > 175).sum()) / max(len(garment_brightness), 1)
-        dark_frac_top = float((garment_brightness < 80).sum()) / max(len(garment_brightness), 1)
+        # 1. Stripe — must precede bright-white: white stripe pixels fool _try_bright_white_top.
+        if brightness_std > 24:
+            stripe_hit = _try_stripe_color(garment_pixels, garment_brightness, brightness_std, category_group)
+            if stripe_hit:
+                return stripe_hit
+        # 1b. Polka-dot / printed top: bright background + discrete dark elements.
+        # Must run AFTER stripe check (stripes already handled with a specific colour)
+        # but BEFORE _try_bright_white_top, which would otherwise claim the white
+        # pixels and return "white" without ever seeing the dot pattern.
+        _dark_frac_top = float((garment_brightness < 80).sum()) / max(len(garment_brightness), 1)
+        _bright_frac_top = float((garment_brightness > 175).sum()) / max(len(garment_brightness), 1)
+        if _bright_frac_top >= 0.30 and _dark_frac_top >= 0.04 and brightness_std > 20:
+            print(f"🎨 Detected color: pattern (polka-dot/print top)  std={brightness_std:.1f}, dark={_dark_frac_top:.2f}")
+            return "pattern", False
+        # 2. Solid white and mixed-crop white
         white_hit = _try_bright_white_top(garment_pixels, garment_brightness)
         if white_hit:
             return white_hit
-        if bright_frac >= 0.12 and _is_simple_horizontal_stripe(garment_pixels, garment_brightness):
-            stripe = _classify_stripe_dark_pixels(garment_pixels, garment_brightness)
-            if stripe:
-                color, is_stripe = stripe
-                print(f"🎨 Detected color: {color} (top-stripe-before-white rule)")
-                return color, is_stripe
         white_hit = _try_solid_white_top(garment_pixels, garment_brightness)
         if white_hit:
             return white_hit
+        # 3. Warm beige / taupe
         beige_hit = _try_warm_beige_top(garment_pixels, garment_brightness)
         if beige_hit:
             return beige_hit
-        # Very high bright fraction with almost no dark pixels often means background bleed, not a solid white tee.
-        if bright_frac >= 0.85 and brightness_std < 20:
-            pass
-        elif bright_frac >= 0.07 and dark_frac_top < 0.04 and brightness_std < 28:
-            bright_px = garment_pixels[garment_brightness > 175]
-            br, bg, bb = bright_px.mean(axis=0)
-            bright_sat = max(br, bg, bb) - min(br, bg, bb)
-            neutral = abs(br - bg) < 12 and abs(bg - bb) < 12
-            if neutral and bright_sat < 35:
-                print(f"🎨 Detected color: white (bright-fraction-top rule)  bright_frac={bright_frac:.2f}")
-                return "white", False
-    # Pastel purple/lavender tees read as white in bright outdoor light — check after white rules.
-    if category_group == "top":
+        # 4. Light-wash denim / chambray
+        # Threshold starts at 100 (not 130) because dark-area shadows on denim
+        # can pull avg_brightness below 130 even on a medium-wash jacket.
+        avg_sat = float(max(r, g, b) - min(r, g, b))
+        if 100 <= avg_brightness <= 235 and avg_sat >= 10 and b >= r + 8 and b >= g - 8:
+            print(f"🎨 Detected color: light_blue (denim-top rule)  avg_rgb=({r:.0f},{g:.0f},{b:.0f})")
+            return "light_blue", False
+        # 5. Lavender / dusty purple
         purple_px = garment_pixels[
             (garment_pixels[:, 2] >= garment_pixels[:, 0])
             & (garment_brightness > 115)
@@ -782,36 +871,51 @@ def get_fashion_color(pil_img, category_group=None):
         if len(purple_px) >= max(20, int(len(garment_pixels) * 0.10)):
             pr, pg, pb = purple_px.mean(axis=0)
             purple_sat = max(pr, pg, pb) - min(pr, pg, pb)
-            if pb >= pr + 12 and purple_sat >= 18 and purple_sat < 55:
+            # True lavender/purple has R ≥ G (pink-purple hue).
+            # Blue denim has G > R (blue-teal hue) — exclude it here; the
+            # light_blue rule above already handles denim correctly.
+            if pb >= pr + 12 and purple_sat >= 18 and purple_sat < 55 and pr >= pg:
                 print(f"🎨 Detected color: lavender (purple-top rule)  avg_rgb=({pr:.0f},{pg:.0f},{pb:.0f})")
                 return "lavender", False
-    # White tee tucked into dark jeans — top zone mixes shirt + waist; use bright pixels.
-    if category_group == "top" and brightness_std > 35:
-        stripe_hit = _try_stripe_color(garment_pixels, garment_brightness, brightness_std, category_group)
-        if stripe_hit:
-            return stripe_hit
-        white_hit = _try_bright_white_top(garment_pixels, garment_brightness)
-        if white_hit:
-            return white_hit
-        bright_garment = garment_pixels[garment_brightness > 170]
-        dark_garment = garment_pixels[garment_brightness < 90]
-        if (
-            len(bright_garment) >= max(25, int(len(garment_pixels) * 0.15))
-            and len(bright_garment) > len(dark_garment)
-        ):
-            br, bg, bb = bright_garment.mean(axis=0)
-            bright_avg = (float(br) + float(bg) + float(bb)) / 3.0
-            bright_sat = max(br, bg, bb) - min(br, bg, bb)
-            neutral = abs(br - bg) < 12 and abs(bg - bb) < 12
-            white_hit = _try_bright_white_top(bright_garment, bright_garment.mean(axis=1))
-            if white_hit:
-                return white_hit
-            beige_hit = _try_warm_beige_top(bright_garment, bright_garment.mean(axis=1))
-            if beige_hit:
-                return beige_hit
-            if bright_avg > 168 and bright_sat < 45 and neutral and bright_avg >= 218:
-                print(f"🎨 Detected color: white (bright-top rule)  bright_avg={bright_avg:.0f}")
-                return "white", False
+        # 6. Mixed-crop fallback — white or beige tee tucked into dark jeans.
+        # The full-crop average is dragged dark by pants pixels. Re-score only the
+        # bright-pixel cluster (the shirt) to retrieve the actual garment colour.
+        if brightness_std > 35:
+            bright_garment = garment_pixels[garment_brightness > 170]
+            dark_garment = garment_pixels[garment_brightness < 90]
+            if (
+                len(bright_garment) >= max(25, int(len(garment_pixels) * 0.15))
+                and len(bright_garment) > len(dark_garment)
+            ):
+                white_hit = _try_bright_white_top(bright_garment, bright_garment.mean(axis=1))
+                if white_hit:
+                    return white_hit
+                beige_hit = _try_warm_beige_top(bright_garment, bright_garment.mean(axis=1))
+                if beige_hit:
+                    return beige_hit
+                br, bg, bb = bright_garment.mean(axis=0)
+                bright_avg = (float(br) + float(bg) + float(bb)) / 3.0
+                bright_sat = max(br, bg, bb) - min(br, bg, bb)
+                neutral = abs(br - bg) < 12 and abs(bg - bb) < 12
+                if bright_avg > 168 and bright_sat < 45 and neutral and bright_avg >= 218:
+                    print(f"🎨 Detected color: white (bright-top rule)  bright_avg={bright_avg:.0f}")
+                    return "white", False
+        # 7. Bright-fraction last resort — covers low-variance crops where
+        # _try_bright_white_top (22% threshold) doesn't fire but the garment
+        # is clearly mostly bright and neutral (e.g. overexposed/studio white top).
+        bright_frac = float((garment_brightness > 175).sum()) / max(len(garment_brightness), 1)
+        dark_frac_top = float((garment_brightness < 80).sum()) / max(len(garment_brightness), 1)
+        if bright_frac >= 0.85 and brightness_std < 20:
+            pass  # background bleed, not a white garment
+        elif bright_frac >= 0.07 and dark_frac_top < 0.04 and brightness_std < 28:
+            bright_px = garment_pixels[garment_brightness > 175]
+            if len(bright_px) >= 20:
+                br, bg, bb = bright_px.mean(axis=0)
+                bright_sat = max(br, bg, bb) - min(br, bg, bb)
+                neutral = abs(br - bg) < 12 and abs(bg - bb) < 12
+                if neutral and bright_sat < 35:
+                    print(f"🎨 Detected color: white (bright-fraction-top rule)  bright_frac={bright_frac:.2f}")
+                    return "white", False
     # White shorts/skirts with a dark belt: bright garment pixels dominate — use them, not belt.
     if category_group in ("bottom", "skirt") and brightness_std > 45:
         bright_garment = garment_pixels[garment_brightness > 165]
@@ -829,6 +933,26 @@ def get_fashion_color(pil_img, category_group=None):
     if not skip_pattern and category_group == "bottom" and brightness_std > 32 and avg_brightness > 145:
         print(f"🎨 Detected color: pattern (printed-bottom)  std={brightness_std:.1f}")
         return "pattern", False
+    # Dark-background print: light polka-dots / pattern elements on dark bottoms/dresses.
+    # Thresholds are tighter than the skirt rules because dark denim naturally has
+    # specular highlights — we only fire when the bright fraction is clearly too large
+    # to be explained by fabric sheen (>= 10%) and std is high (> 32).
+    if not skip_pattern and category_group in ("bottom", "dress") and brightness_std > 32:
+        _light_on_dark_bright = float((garment_brightness > 170).sum()) / max(len(garment_brightness), 1)
+        if avg_brightness < 120 and _light_on_dark_bright >= 0.10:
+            print(f"🎨 Detected color: pattern (light-on-dark print)  std={brightness_std:.1f}, avg={avg_brightness:.0f}")
+            return "pattern", False
+    # Monochrome high-contrast print: black polka-dots on white, zebra, houndstooth.
+    # The light-floral rule below requires saturation.std() > 18, but black+white prints
+    # have near-zero saturation on BOTH colours, so saturation variance is ~0 and that
+    # rule misses them entirely.  This rule fires on high brightness std + both dark and
+    # bright pixels present in meaningful proportions, regardless of saturation.
+    if not skip_pattern and category_group not in ("top", "skirt"):
+        _mono_dark = float((garment_brightness < 80).sum()) / max(len(garment_brightness), 1)
+        _mono_bright = float((garment_brightness > 175).sum()) / max(len(garment_brightness), 1)
+        if brightness_std > 26 and avg_brightness > 130 and _mono_dark >= 0.03 and _mono_bright >= 0.35:
+            print(f"🎨 Detected color: pattern (mono-contrast print)  std={brightness_std:.1f}")
+            return "pattern", False
     if not skip_pattern and brightness_std > 38 and avg_brightness > 155 and float(saturation.std()) > 18:
         print(f"🎨 Detected color: pattern (light-floral)  brightness_std={brightness_std:.1f}, avg={avg_brightness:.0f}")
         return "pattern", False
@@ -846,35 +970,47 @@ def get_fashion_color(pil_img, category_group=None):
             return stripe
         dark_pixels = garment_pixels[garment_brightness < 120]
         if len(dark_pixels) >= 30:
-            dark_avg = dark_pixels.mean(axis=0)
-            r, g, b = float(dark_avg[0]), float(dark_avg[1]), float(dark_avg[2])
-            avg_brightness = (r + g + b) / 3.0
-            # Only treat as a simple stripe when the dark pixels are TRULY dark (< 65).
-            # Floral/complex prints have darker flower petals averaging ~70-90 brightness —
-            # using those as the "stripe colour" gives wrong results (e.g. brown flowers on
-            # cream shorts → detected as brown, shows brown skirts instead of floral shorts).
-            # For those, skip colour filtering and rely on visual similarity only.
-            if avg_brightness >= 65:
-                print(f"🎨 Detected color: pattern (complex-print)  brightness_std={brightness_std:.1f}, dark_avg={avg_brightness:.0f}")
-                return "pattern", False
-            print(f"🎨 Pattern detected (std={brightness_std:.1f}), re-scoring dark pixels avg=({r:.0f},{g:.0f},{b:.0f})")
-            if category_group == "top":
-                beige_hit = _try_warm_beige_top(garment_pixels, garment_brightness)
-                if beige_hit:
-                    return beige_hit
-                white_hit = _try_bright_white_top(garment_pixels, garment_brightness)
-                if white_hit:
-                    return white_hit
-            # Navy stripe pixels are often very dark (47,46,54) — a blue bias of only
-            # 7 points. The global dark-rule requires b > r+15, which is too strict here.
-            # Use a lower threshold of b > r+5 specifically for pattern-detected items.
-            if avg_brightness < 60 and b > r + 5:
-                if (b - r) < 12 and abs(r - g) < 15:
-                    print(f"🎨 Detected color: black (dark-neutral-pattern)  avg_rgb=({r:.0f},{g:.0f},{b:.0f})")
-                    return "black", True
-                print(f"🎨 Detected color: navy (dark-rule-pattern)  avg_rgb=({r:.0f},{g:.0f},{b:.0f})")
-                return "navy", True   # is_stripe=True → caller uses stripe-specific vector
-            # Fall through — normal rules now run on the dark-pixel average (non-navy stripes)
+            # Guard: if ≥ 72 % of the crop is bright the garment is fundamentally
+            # light-coloured.  Any dark pixels come from an accessory or shadow
+            # (e.g. a bag handle crossing the vest zone), NOT from the garment's
+            # own stripe/pattern.  Reassigning r,g,b to those dark pixels would
+            # corrupt every downstream rule (step 3 avg_brightness < 60 would fire
+            # on the accessory colour instead of the garment colour).
+            _bright_guard = float((garment_brightness > 175).sum()) / max(len(garment_brightness), 1)
+            if _bright_guard >= 0.72:
+                print(f"🎨 Stripe re-score skipped (bright_frac={_bright_guard:.2f}) — light garment, dark pixels are intruder")
+                # Leave r, g, b, avg_brightness as the overall garment averages so
+                # the bright-colour / palette rules correctly classify the garment.
+            else:
+                dark_avg = dark_pixels.mean(axis=0)
+                r, g, b = float(dark_avg[0]), float(dark_avg[1]), float(dark_avg[2])
+                avg_brightness = (r + g + b) / 3.0
+                # Only treat as a simple stripe when the dark pixels are TRULY dark (< 65).
+                # Floral/complex prints have darker flower petals averaging ~70-90 brightness —
+                # using those as the "stripe colour" gives wrong results (e.g. brown flowers on
+                # cream shorts → detected as brown, shows brown skirts instead of floral shorts).
+                # For those, skip colour filtering and rely on visual similarity only.
+                if avg_brightness >= 65:
+                    print(f"🎨 Detected color: pattern (complex-print)  brightness_std={brightness_std:.1f}, dark_avg={avg_brightness:.0f}")
+                    return "pattern", False
+                print(f"🎨 Pattern detected (std={brightness_std:.1f}), re-scoring dark pixels avg=({r:.0f},{g:.0f},{b:.0f})")
+                if category_group == "top":
+                    beige_hit = _try_warm_beige_top(garment_pixels, garment_brightness)
+                    if beige_hit:
+                        return beige_hit
+                    white_hit = _try_bright_white_top(garment_pixels, garment_brightness)
+                    if white_hit:
+                        return white_hit
+                # Navy stripe pixels are often very dark (47,46,54) — a blue bias of only
+                # 7 points. The global dark-rule requires b > r+15, which is too strict here.
+                # Use a lower threshold of b > r+5 specifically for pattern-detected items.
+                if avg_brightness < 60 and b > r + 5:
+                    if (b - r) < 12 and abs(r - g) < 15:
+                        print(f"🎨 Detected color: black (dark-neutral-pattern)  avg_rgb=({r:.0f},{g:.0f},{b:.0f})")
+                        return "black", True
+                    print(f"🎨 Detected color: navy (dark-rule-pattern)  avg_rgb=({r:.0f},{g:.0f},{b:.0f})")
+                    return "navy", True   # is_stripe=True → caller uses stripe-specific vector
+                # Fall through — normal rules now run on the dark-pixel average (non-navy stripes)
         else:
             # Mostly light-coloured print (e.g. pastel on white) — no dominant dark colour
             print(f"🎨 Detected color: pattern (light-print)  brightness_std={brightness_std:.1f}")
@@ -883,6 +1019,12 @@ def get_fashion_color(pil_img, category_group=None):
     # ── Step 2: bright-colour rule (white garments) ───────────────────────────
     top_white_threshold = 175 if category_group == "top" else 190
     if avg_brightness > top_white_threshold and saturation.mean() < 30:
+        # Pixel analysis at 100×100 cannot detect sparse small dots/prints.
+        # CLIP sees the full-resolution crop and reliably spots polka-dot /
+        # printed garments that the pixel stats miss entirely.
+        if category_group in ("skirt", "top", "bottom", "dress") and _clip_is_patterned(pil_img):
+            print(f"🎨 Detected color: pattern (CLIP override of bright-rule)  avg_rgb=({r:.0f},{g:.0f},{b:.0f})")
+            return "pattern", False
         print(f"🎨 Detected color: white (bright-rule)  avg_rgb=({r:.0f},{g:.0f},{b:.0f})")
         return "white", False
 
@@ -1193,12 +1335,24 @@ def _refine_shoe_color(crop_img: Image.Image, color: str, shoe_style: Optional[s
     foot = crop_img.crop((int(w * 0.08), int(h * 0.28), int(w * 0.92), h))
     arr = np.array(foot.convert("RGB"), dtype=np.float32).reshape(-1, 3)
     br = arr.mean(axis=1)
+    dark_px = arr[(br < 78) & ~((arr[:, 2] > arr[:, 0] + 10) & (br < 160))]
+    dark_frac = float(len(dark_px)) / max(len(arr), 1)
+
+    # Dark-strap priority (runs on unmasked pixels so threshold is 4%, not 3%).
+    # A black strap/sole covers 10-15% of the foot zone; beige-flip-flop shadows
+    # only ~1-2%.  Check this BEFORE the warm/skin rule so foot skin can never
+    # override a clearly dark shoe.
+    if dark_frac >= 0.040 and len(dark_px) >= 10:
+        dr, dg, db = dark_px.mean(axis=0)
+        if (float(dr) + float(dg) + float(db)) / 3.0 < 68:
+            print(f"👟 Shoe refine → black ({shoe_style or 'shoe'}) [dark-strap]")
+            return "black"
+
     warm_px = arr[
         (br >= 88) & (br <= 215)
         & (arr[:, 0] >= arr[:, 2] - 6)
         & ~((arr[:, 2] > arr[:, 0] + 10) & (br < 160))
     ]
-    dark_px = arr[(br < 78) & ~((arr[:, 2] > arr[:, 0] + 10) & (br < 160))]
     if len(warm_px) >= max(18, int(len(arr) * 0.12)):
         wr, wg, wb = warm_px.mean(axis=0)
         warm_avg = (float(wr) + float(wg) + float(wb)) / 3.0
@@ -1580,8 +1734,12 @@ def detect_bottom_length_clip(pil_img) -> str:
     return best_length
 
 
-def detect_skirt_length_clip(pil_img) -> str:
-    """Classify skirt length: mini vs midi vs maxi."""
+def detect_skirt_length_clip(pil_img) -> tuple:
+    """Classify skirt length: mini vs midi vs maxi.
+
+    Returns (best_length: str, scores: dict) so callers can inspect raw scores
+    for confidence-gated upgrade logic.
+    """
     image_features = _encode_image(pil_img)
     best_length = "midi"
     best_score = -1.0
@@ -1593,17 +1751,16 @@ def detect_skirt_length_clip(pil_img) -> str:
         if score > best_score:
             best_score = score
             best_length = length
-    # Mini skirts in portrait crops often score near midi — only prefer mini when it clearly wins.
     mini_score = scores.get("mini", 0)
     midi_score = scores.get("midi", 0)
     maxi_score = scores.get("maxi", 0)
-    if mini_score >= best_score - 0.015:
-        best_length = "mini"
-    elif maxi_score >= midi_score + 0.008 and maxi_score >= mini_score:
+    # Let argmax win; apply a conservative maxi boost only since floor-length garments
+    # are systematically under-scored by CLIP relative to mini/midi prompts.
+    if maxi_score >= midi_score + 0.010 and maxi_score >= mini_score:
         best_length = "maxi"
     rounded = {k: round(v, 3) for k, v in sorted(scores.items(), key=lambda x: -x[1])}
     print(f"Skirt length: {best_length}  scores: {rounded}")
-    return best_length
+    return best_length, scores
 
 
 SKIRT_LENGTH_COLOR_PHRASES = {
@@ -2256,6 +2413,35 @@ def _resolve_zone_force_category(zone_name: str, scores: dict, crop: Optional[Im
     return _ZONE_FORCE_CATEGORY.get(zone_name)
 
 
+def _detect_white_vs_beige_top_clip(crop_img: Image.Image, pixel_color: str) -> str:
+    """CLIP tiebreaker called when pixel rules returned "white" on a top.
+
+    Guards against warm-lit / outdoor beige tops being misclassified as white.
+    Beige pixel detections are already strict — this only corrects white→beige.
+    Only overrides when CLIP has clear confidence (margin ≥ 0.018).
+    """
+    image_features = _encode_image(crop_img)
+    white_prompts = [
+        "a crisp bright white cotton t-shirt with neutral pure white color",
+        "a solid white tee shirt with cool bright neutral hue no warm tones",
+        "a plain bright white garment with neutral cool white color",
+    ]
+    beige_prompts = [
+        "a warm sandy beige cotton t-shirt with earthy warm hue",
+        "an earthy taupe outdoor shirt with warm khaki sandy undertone",
+        "a soft sand-colored top with warm caramel neutral hue",
+    ]
+    white_feats = _encode_texts(white_prompts)
+    beige_feats = _encode_texts(beige_prompts)
+    white_s = float((image_features @ white_feats.T).max())
+    beige_s = float((image_features @ beige_feats.T).max())
+    print(f"🎨 White/beige CLIP: white={white_s:.3f} beige={beige_s:.3f} (pixel={pixel_color})")
+    if beige_s >= white_s + 0.018:
+        print(f"🎨 → overriding to beige (CLIP margin {beige_s - white_s:+.3f})")
+        return "beige"
+    return "white"
+
+
 def _analyze_garment_crop(
     crop_img: Image.Image,
     bbox: list,
@@ -2263,6 +2449,7 @@ def _analyze_garment_crop(
     yolo_label: Optional[str] = None,
     yolo_conf: float = 0.0,
     force_category: Optional[str] = None,
+    length_hint_img: Optional[Image.Image] = None,
 ) -> Optional[dict]:
     """Run full CLIP pipeline on one crop and return a Total Look item dict."""
     category_group = force_category or detect_category_clip(crop_img)
@@ -2335,6 +2522,11 @@ def _analyze_garment_crop(
             color = "black"
         if fabric == "denim" and color in ("white", "grey"):
             color = "light_blue"
+        # CLIP tiebreaker: only called when pixel rules returned "white" to guard
+        # against warm-lit / outdoor beige tops being misread as white.
+        # Beige pixel detections (_try_warm_beige_top) are strict enough to trust.
+        if color == "white" and not is_stripe and fabric not in ("denim", "leather"):
+            color = _detect_white_vs_beige_top_clip(crop_img, color)
 
     shoe_style = detect_shoe_style_clip(crop_img) if category_group == "shoes" else None
     if category_group == "shoes":
@@ -2347,7 +2539,22 @@ def _analyze_garment_crop(
     elif category_group == "top" and fabric == "leather":
         top_style = "coat"
     bottom_length = detect_bottom_length_clip(crop_img) if category_group == "bottom" else None
-    skirt_length = detect_skirt_length_clip(crop_img) if category_group == "skirt" else None
+    if category_group == "skirt":
+        skirt_length, _ = detect_skirt_length_clip(crop_img)
+        # When the standard zone crop (44-76%) says "mini", verify against a taller
+        # crop (44-95%) that captures the full garment length.  Only upgrade if the
+        # longer-length label beats mini by ≥ 0.012 on the taller crop — this rules
+        # out false upgrades caused by boots/bare-legs below a real mini skirt.
+        if skirt_length == "mini" and length_hint_img is not None:
+            tall_length, tall_scores = detect_skirt_length_clip(length_hint_img)
+            if tall_length in ("midi", "maxi"):
+                mini_s = tall_scores.get("mini", 0)
+                tall_s = tall_scores.get(tall_length, 0)
+                if tall_s >= mini_s + 0.012:
+                    print(f"📐 Skirt length upgraded: mini → {tall_length} (tall-crop margin={tall_s - mini_s:.3f})")
+                    skirt_length = tall_length
+    else:
+        skirt_length = None
     if category_group == "skirt" and color == "grey":
         midi_s = maxi_s = 0.0
         image_features = _encode_image(crop_img)
@@ -2458,27 +2665,53 @@ def _detect_full_dress(img: Image.Image) -> Optional[dict]:
     return None
 
 
-def _yolo_garment_candidates(img: Image.Image) -> list:
-    w, h = img.size
+def _yolo_garment_candidates(img: Image.Image) -> tuple:
+    """Return (garment_candidates, bag_boxes).
+
+    bag_boxes is a list of (x0,y0,x1,y1) ints for every handbag / backpack /
+    suitcase detected in the image.  These are passed to _zone_garment_candidates
+    so zone crops can be cleaned before colour analysis.
+
+    Two-pass design: bags are collected first so we can paint them out of the
+    image before cropping individual garments.  This prevents the bag handle
+    (visible inside the vest YOLO box, for example) from contaminating the
+    garment's colour statistics.
+    """
     results = yolo_model(img)
-    candidates = []
+
+    # Pass 1 — collect bag boxes and raw garment detections
+    bag_boxes = []
+    garment_detections = []
     for r in results:
         for box in r.boxes:
             label = yolo_model.names[int(box.cls)].lower()
             conf = float(box.conf)
             if conf < 0.25:
                 continue
-            if label in _IGNORED_YOLO_CLASSES:
-                continue
             coords = box.xyxy[0].tolist()
-            crop = img.crop(tuple(coords))
-            item = _analyze_garment_crop(
-                crop, coords, "yolo",
-                yolo_label=label, yolo_conf=conf,
-            )
-            if item:
-                candidates.append(item)
-    return candidates
+            if label in _BAG_YOLO_CLASSES:
+                bag_boxes.append(tuple(int(c) for c in coords))
+            elif label not in _IGNORED_YOLO_CLASSES:
+                garment_detections.append((label, conf, coords))
+
+    if bag_boxes:
+        print(f"🎒 Bag occlusion: masking {len(bag_boxes)} accessory box(es) from YOLO + zone crops")
+
+    # Create bag-masked image so garment crops are clean
+    clean_img = _paint_out_boxes(img, bag_boxes)
+
+    # Pass 2 — analyse each garment crop using the cleaned image
+    candidates = []
+    for label, conf, coords in garment_detections:
+        crop = clean_img.crop(tuple(coords))
+        item = _analyze_garment_crop(
+            crop, coords, "yolo",
+            yolo_label=label, yolo_conf=conf,
+        )
+        if item:
+            candidates.append(item)
+
+    return candidates, bag_boxes
 
 
 _ZONE_FORCE_CATEGORY = {
@@ -2535,7 +2768,11 @@ def _pick_primary_person_bbox(img: Image.Image) -> Optional[tuple]:
     return best_coords
 
 
-def _zone_garment_candidates(img: Image.Image, region: Optional[tuple] = None) -> list:
+def _zone_garment_candidates(
+    img: Image.Image,
+    region: Optional[tuple] = None,
+    bag_boxes: Optional[list] = None,
+) -> list:
     w, h = img.size
     if region is None:
         if h <= w * 0.85:
@@ -2547,6 +2784,13 @@ def _zone_garment_candidates(img: Image.Image, region: Optional[tuple] = None) -
     rh = ry1 - ry0
     if rw < 8 or rh < 8:
         return []
+
+    # Paint detected bags/backpacks out of the image before cropping zones.
+    # The fill colour (245,245,245) is above the bright-background threshold
+    # in get_fashion_color, so painted pixels are excluded from garment colour
+    # statistics — they never inflate dark_frac or distort avg_brightness.
+    base_img = _paint_out_boxes(img, bag_boxes or [])
+
     candidates = []
     for zone_name, y0, y1, allowed_slots in _TOTAL_LOOK_ZONES:
         bbox = [
@@ -2555,7 +2799,7 @@ def _zone_garment_candidates(img: Image.Image, region: Optional[tuple] = None) -
             int(rx0 + rw * 0.95),
             int(ry0 + rh * y1),
         ]
-        crop = img.crop(tuple(bbox))
+        crop = base_img.crop(tuple(bbox))
         scores = _score_categories(crop)
         if zone_name == "belt":
             belt_s = scores.get("belt", 0)
@@ -2572,8 +2816,22 @@ def _zone_garment_candidates(img: Image.Image, region: Optional[tuple] = None) -
         forced = _resolve_zone_force_category(zone_name, scores, crop)
         if not forced:
             continue
+        # For the bottom/skirt zone, pass a taller crop (44%→95%) as a length
+        # hint so detect_skirt_length_clip sees the full length of long skirts.
+        # The standard zone crop stops at 76%, cutting off ankle-length skirts
+        # and causing them to be mis-labelled as mini.
+        length_hint = None
+        if zone_name == "bottom":
+            tall_bbox = [
+                int(rx0 + rw * 0.05),
+                int(ry0 + rh * 0.44),
+                int(rx0 + rw * 0.95),
+                int(ry0 + rh * 0.95),
+            ]
+            length_hint = base_img.crop(tuple(tall_bbox))
         item = _analyze_garment_crop(
             crop, bbox, f"zone-{zone_name}", force_category=forced,
+            length_hint_img=length_hint,
         )
         if item and item["slotId"] in allowed_slots:
             candidates.append(item)
@@ -2641,18 +2899,18 @@ def process_total_look_logic(img: Image.Image) -> dict:
         }
 
     candidates = []
-    yolo_cands = _yolo_garment_candidates(img)
+    yolo_cands, bag_boxes = _yolo_garment_candidates(img)
     if yolo_cands:
         methods.append("yolo")
         candidates.extend(yolo_cands)
 
     if h > w * 0.85:
-        zone_cands = _zone_garment_candidates(img)
+        zone_cands = _zone_garment_candidates(img, bag_boxes=bag_boxes)
         if zone_cands:
             methods.append("zone")
             candidates.extend(zone_cands)
     elif person_bbox:
-        zone_cands = _zone_garment_candidates(img, region=person_bbox)
+        zone_cands = _zone_garment_candidates(img, region=person_bbox, bag_boxes=bag_boxes)
         if zone_cands:
             methods.append("person-zone")
             candidates.extend(zone_cands)
@@ -2716,13 +2974,22 @@ def process_image_logic(img):
             "color": color,
         }, color, is_stripe, category_group, fabric, shoe_style, bottom_length, top_style))
     else:
+        # Collect bag boxes first so garment crops can be cleaned
+        single_bag_boxes = []
+        for r in results:
+            for box in r.boxes:
+                lbl = yolo_model.names[int(box.cls)].lower()
+                if float(box.conf) > 0.2 and lbl in _BAG_YOLO_CLASSES:
+                    single_bag_boxes.append(tuple(int(c) for c in box.xyxy[0].tolist()))
+        clean_img_single = _paint_out_boxes(img, single_bag_boxes)
+
         for r in results:
             for box in r.boxes:
                 label = yolo_model.names[int(box.cls)]
                 conf = float(box.conf)
                 if conf > 0.2:
                     coords = box.xyxy[0].tolist()
-                    crop_img = img.crop((coords[0], coords[1], coords[2], coords[3]))
+                    crop_img = clean_img_single.crop((coords[0], coords[1], coords[2], coords[3]))
 
                     image_features = _encode_image(crop_img)
                     embedding = image_features.cpu().numpy().flatten().tolist()

@@ -679,6 +679,13 @@ def get_fashion_color(pil_img, category_group=None):
         if bright_frac >= 0.20 and dark_frac >= 0.05 and brightness_std > 12:
             print(f"🎨 Detected color: pattern (polka/print skirt)  bright={bright_frac:.2f}, dark={dark_frac:.2f}")
             return "pattern", False
+        # Sparse polka-dots / small print on a light skirt (2–4% dark coverage).
+        # Dark-fraction falls below the 0.05 threshold above but brightness std is
+        # still elevated and the fabric is predominantly bright — must fire before
+        # the grey rule below which would otherwise win on the same pixel stats.
+        if brightness_std > 22 and avg_brightness > 175 and dark_frac >= 0.02 and bright_frac >= 0.45:
+            print(f"🎨 Detected color: pattern (sparse-dot skirt)  std={brightness_std:.1f}, dark={dark_frac:.2f}")
+            return "pattern", False
         if skirt_avg_sat < 25 and 115 <= avg_brightness <= 210 and dark_frac < 0.12:
             print(f"🎨 Detected color: grey (solid-skirt rule)  avg_rgb=({r:.0f},{g:.0f},{b:.0f})")
             return "grey", False
@@ -747,6 +754,15 @@ def get_fashion_color(pil_img, category_group=None):
             stripe_hit = _try_stripe_color(garment_pixels, garment_brightness, brightness_std, category_group)
             if stripe_hit:
                 return stripe_hit
+        # 1b. Polka-dot / printed top: bright background + discrete dark elements.
+        # Must run AFTER stripe check (stripes already handled with a specific colour)
+        # but BEFORE _try_bright_white_top, which would otherwise claim the white
+        # pixels and return "white" without ever seeing the dot pattern.
+        _dark_frac_top = float((garment_brightness < 80).sum()) / max(len(garment_brightness), 1)
+        _bright_frac_top = float((garment_brightness > 175).sum()) / max(len(garment_brightness), 1)
+        if _bright_frac_top >= 0.30 and _dark_frac_top >= 0.04 and brightness_std > 20:
+            print(f"🎨 Detected color: pattern (polka-dot/print top)  std={brightness_std:.1f}, dark={_dark_frac_top:.2f}")
+            return "pattern", False
         # 2. Solid white and mixed-crop white
         white_hit = _try_bright_white_top(garment_pixels, garment_brightness)
         if white_hit:
@@ -831,6 +847,26 @@ def get_fashion_color(pil_img, category_group=None):
     if not skip_pattern and category_group == "bottom" and brightness_std > 32 and avg_brightness > 145:
         print(f"🎨 Detected color: pattern (printed-bottom)  std={brightness_std:.1f}")
         return "pattern", False
+    # Dark-background print: light polka-dots / pattern elements on dark bottoms/dresses.
+    # Thresholds are tighter than the skirt rules because dark denim naturally has
+    # specular highlights — we only fire when the bright fraction is clearly too large
+    # to be explained by fabric sheen (>= 10%) and std is high (> 32).
+    if not skip_pattern and category_group in ("bottom", "dress") and brightness_std > 32:
+        _light_on_dark_bright = float((garment_brightness > 170).sum()) / max(len(garment_brightness), 1)
+        if avg_brightness < 120 and _light_on_dark_bright >= 0.10:
+            print(f"🎨 Detected color: pattern (light-on-dark print)  std={brightness_std:.1f}, avg={avg_brightness:.0f}")
+            return "pattern", False
+    # Monochrome high-contrast print: black polka-dots on white, zebra, houndstooth.
+    # The light-floral rule below requires saturation.std() > 18, but black+white prints
+    # have near-zero saturation on BOTH colours, so saturation variance is ~0 and that
+    # rule misses them entirely.  This rule fires on high brightness std + both dark and
+    # bright pixels present in meaningful proportions, regardless of saturation.
+    if not skip_pattern and category_group not in ("top", "skirt"):
+        _mono_dark = float((garment_brightness < 80).sum()) / max(len(garment_brightness), 1)
+        _mono_bright = float((garment_brightness > 175).sum()) / max(len(garment_brightness), 1)
+        if brightness_std > 26 and avg_brightness > 130 and _mono_dark >= 0.03 and _mono_bright >= 0.35:
+            print(f"🎨 Detected color: pattern (mono-contrast print)  std={brightness_std:.1f}")
+            return "pattern", False
     if not skip_pattern and brightness_std > 38 and avg_brightness > 155 and float(saturation.std()) > 18:
         print(f"🎨 Detected color: pattern (light-floral)  brightness_std={brightness_std:.1f}, avg={avg_brightness:.0f}")
         return "pattern", False

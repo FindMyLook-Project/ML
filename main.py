@@ -239,19 +239,23 @@ CLIP_BOTTOM_LENGTH_PROMPTS = {
 
 CLIP_SKIRT_LENGTH_PROMPTS = {
     "mini": [
-        "black high waisted mini skirt above the knee with front patch pockets",
-        "short black mini skirt mid thigh length on a model",
-        "structured black mini skirt with belt loops above the knee",
+        "high waisted mini skirt above the knee with front patch pockets",
+        "short mini skirt mid thigh length on a model",
+        "structured mini skirt with belt loops well above the knee",
+        "denim mini skirt exposing most of the thigh",
     ],
     "midi": [
-        "black pleated midi skirt below the knee on a model",
+        "pleated midi skirt ending below the knee on a model",
         "knee length A-line midi skirt on a model",
-        "asymmetric hem black midi skirt below the knee",
+        "midi skirt that falls between the knee and ankle",
+        "asymmetric hem midi skirt below the knee",
     ],
     "maxi": [
-        "long black maxi skirt floor length on a model",
-        "flowing black maxi skirt reaching the ankles",
-        "black satin maxi skirt with side slit full length",
+        "long maxi skirt reaching the floor on a model",
+        "flowing maxi skirt covering the ankles and feet",
+        "full length maxi skirt touching the ground",
+        "satin maxi skirt with side slit floor length",
+        "a skirt that goes all the way to the ankles",
     ],
 }
 
@@ -430,7 +434,9 @@ def _classify_stripe_dark_pixels(garment_pixels, garment_brightness) -> Optional
         if r >= g - 6 and (r - b) >= 16 and g >= b + 6:
             continue
         if avg_brightness < 60 and b > r + 5:
-            if (b - r) < 12 and abs(r - g) < 15:
+            # Only call it black if the blue dominance is very weak (washed-out dark pixel,
+            # not true navy). A real navy stripe has b-r >= 8.
+            if (b - r) < 8 and abs(r - g) < 12:
                 return "black", True
             return "navy", True
         return "black", True
@@ -639,12 +645,14 @@ def get_fashion_color(pil_img, category_group=None):
     brightness_std = float(garment_brightness.std())
 
     if category_group == "top" and brightness_std > 24:
-        white_hit = _try_bright_white_top(garment_pixels, garment_brightness)
-        if white_hit:
-            return white_hit
+        # Stripe check MUST run before bright-white: a navy+white stripe shirt has
+        # ~50% bright (white stripe) pixels that would fool _try_bright_white_top.
         stripe_hit = _try_stripe_color(garment_pixels, garment_brightness, brightness_std, category_group)
         if stripe_hit:
             return stripe_hit
+        white_hit = _try_bright_white_top(garment_pixels, garment_brightness)
+        if white_hit:
+            return white_hit
         white_hit = _try_solid_white_top(garment_pixels, garment_brightness)
         if white_hit:
             return white_hit
@@ -1593,13 +1601,12 @@ def detect_skirt_length_clip(pil_img) -> str:
         if score > best_score:
             best_score = score
             best_length = length
-    # Mini skirts in portrait crops often score near midi — only prefer mini when it clearly wins.
     mini_score = scores.get("mini", 0)
     midi_score = scores.get("midi", 0)
     maxi_score = scores.get("maxi", 0)
-    if mini_score >= best_score - 0.015:
-        best_length = "mini"
-    elif maxi_score >= midi_score + 0.008 and maxi_score >= mini_score:
+    # Let argmax win; apply a conservative maxi boost only since floor-length garments
+    # are systematically under-scored by CLIP relative to mini/midi prompts.
+    if maxi_score >= midi_score + 0.010 and maxi_score >= mini_score:
         best_length = "maxi"
     rounded = {k: round(v, 3) for k, v in sorted(scores.items(), key=lambda x: -x[1])}
     print(f"Skirt length: {best_length}  scores: {rounded}")

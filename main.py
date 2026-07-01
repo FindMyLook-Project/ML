@@ -2746,6 +2746,11 @@ def process_image_logic(img):
 class URLRequest(BaseModel):
     image_url: str
 
+@app.get("/")
+async def health_check():
+    """Health check endpoint for Docker to verify the service is ready."""
+    return {"status": "ok", "message": "ML Server is up and running"}    
+
 @app.post("/process-url")
 async def process_url(data: URLRequest):
     """Used by enrichProducts.js. Skips YOLO — product images are already clean."""

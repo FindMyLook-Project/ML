@@ -319,8 +319,20 @@ def _encode_image(pil_img: Image.Image) -> torch.Tensor:
 # Multiple prompts per color → averaged into one strong color centroid.
 COLOR_TEXT_PROMPTS = {
     "black":      ["a black top", "a solid black t-shirt", "black clothing item", "a dark black garment on white background"],
-    "white":      ["a white top", "a pure white t-shirt", "white clothing item", "a bright white garment on white background"],
-    "beige":      ["a beige top", "a cream colored t-shirt", "beige neutral clothing", "a sand-colored garment"],
+    # White prompts: neutral, crisp, cool — no warm tones, no sandy hue.
+    "white":      [
+        "a crisp bright white cotton t-shirt on a model",
+        "a solid white tee shirt with pure neutral cool white color",
+        "a plain white garment with no warm yellow or beige tones",
+        "a bright white blouse with neutral pure white hue",
+    ],
+    # Beige prompts: warm, sandy, taupe — earthy undertone distinguishes from crisp white.
+    "beige":      [
+        "a warm sandy beige cotton t-shirt with earthy warm hue",
+        "an earthy taupe outdoor shirt with warm khaki sandy tone",
+        "a soft sand-colored top with warm caramel neutral undertone",
+        "an outdoor linen shirt in warm beige with yellowish warm cast",
+    ],
     "grey":       ["a grey top", "a gray t-shirt", "grey clothing item", "a charcoal grey garment"],
     "navy":       ["a navy blue top", "a dark navy t-shirt", "navy blue clothing", "a deep navy colored garment"],
     "red":        ["a red top", "a bright red t-shirt", "red clothing item", "a vivid red garment"],
@@ -2245,6 +2257,35 @@ def _resolve_zone_force_category(zone_name: str, scores: dict, crop: Optional[Im
     return _ZONE_FORCE_CATEGORY.get(zone_name)
 
 
+def _detect_white_vs_beige_top_clip(crop_img: Image.Image, pixel_color: str) -> str:
+    """CLIP tiebreaker called when pixel rules returned "white" on a top.
+
+    Guards against warm-lit / outdoor beige tops being misclassified as white.
+    Beige pixel detections are already strict — this only corrects white→beige.
+    Only overrides when CLIP has clear confidence (margin ≥ 0.018).
+    """
+    image_features = _encode_image(crop_img)
+    white_prompts = [
+        "a crisp bright white cotton t-shirt with neutral pure white color",
+        "a solid white tee shirt with cool bright neutral hue no warm tones",
+        "a plain bright white garment with neutral cool white color",
+    ]
+    beige_prompts = [
+        "a warm sandy beige cotton t-shirt with earthy warm hue",
+        "an earthy taupe outdoor shirt with warm khaki sandy undertone",
+        "a soft sand-colored top with warm caramel neutral hue",
+    ]
+    white_feats = _encode_texts(white_prompts)
+    beige_feats = _encode_texts(beige_prompts)
+    white_s = float((image_features @ white_feats.T).max())
+    beige_s = float((image_features @ beige_feats.T).max())
+    print(f"🎨 White/beige CLIP: white={white_s:.3f} beige={beige_s:.3f} (pixel={pixel_color})")
+    if beige_s >= white_s + 0.018:
+        print(f"🎨 → overriding to beige (CLIP margin {beige_s - white_s:+.3f})")
+        return "beige"
+    return "white"
+
+
 def _analyze_garment_crop(
     crop_img: Image.Image,
     bbox: list,
@@ -2324,6 +2365,11 @@ def _analyze_garment_crop(
             color = "black"
         if fabric == "denim" and color in ("white", "grey"):
             color = "light_blue"
+        # CLIP tiebreaker: only called when pixel rules returned "white" to guard
+        # against warm-lit / outdoor beige tops being misread as white.
+        # Beige pixel detections (_try_warm_beige_top) are strict enough to trust.
+        if color == "white" and not is_stripe and fabric not in ("denim", "leather"):
+            color = _detect_white_vs_beige_top_clip(crop_img, color)
 
     shoe_style = detect_shoe_style_clip(crop_img) if category_group == "shoes" else None
     if category_group == "shoes":

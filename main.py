@@ -16,12 +16,11 @@ MAX_TOTAL_LOOK_ITEMS = 4
 
 # COCO classes that are never outfit garments
 _IGNORED_YOLO_CLASSES = {
-    "person", "backpack", "handbag", "tie", "umbrella", "suitcase",
+    "person", "backpack", "handbag", "tie", "umbrella", "suitcase", "cell phone", "bottle", "cup"
 }
 
 # Accessory classes whose pixels contaminate garment zone colour analysis
-_BAG_YOLO_CLASSES = {"handbag", "backpack", "suitcase"}
-
+_BAG_YOLO_CLASSES = {"handbag", "backpack", "suitcase", "cell phone", "bottle", "cup"}
 
 def _paint_out_boxes(
     img: Image.Image,
@@ -52,6 +51,7 @@ _TOTAL_LOOK_ZONES = [
     ("top",    0.05, 0.38, {"top"}),
     ("belt",   0.38, 0.50, {"belt"}),
     ("bottom", 0.44, 0.76, {"bottom", "shorts", "skirt"}),
+    ("lower_bottom", 0.60, 0.95, {"bottom"}),
     ("shoes",  0.72, 0.98, {"shoes"}),
 ]
 
@@ -102,6 +102,8 @@ CLIP_CATEGORY_PROMPTS = {
         "a white sleeveless mock neck crop top on a model",
         "a black shiny leather bomber jacket with gathered sleeves",
         "a dark navy denim sleeveless vest with buttons and waist tie",
+        "a black leather biker jacket with zippers outerwear",
+        "a black leather jacket on a model",
     ],
     "bottom": [
         "blue denim jeans full length on a white background",
@@ -119,7 +121,7 @@ CLIP_CATEGORY_PROMPTS = {
         "a long flowing maxi skirt",
         "a tight knee-length pencil skirt",
         "a black high waisted mini skirt with front patch pockets",
-        "a black leather mini skirt on a model",
+        "a black leather mini skirt showing bare legs",
         "a white midi skirt with black polka dots and lace trim",
     ],
     "dress": [
@@ -327,6 +329,24 @@ _skirt_length_text_features: dict = {}
 for _length, _texts in CLIP_SKIRT_LENGTH_PROMPTS.items():
     _skirt_length_text_features[_length] = _encode_texts(_texts)
 
+def _detect_sequin_color_clip(pil_img: Image.Image) -> str:
+    """זיהוי צבע של בד פייטים בעזרת CLIP כדי לעקוף בעיות החזרי אור באנליזת פיקסלים."""
+    image_features = _encode_image(pil_img)
+    # נגדיר את הצבעים הנפוצים ביותר לפייטים
+    sequin_colors = ["green", "silver", "gold", "pink", "black", "blue", "red", "purple", "white"]
+    scores = {}
+    for color in sequin_colors:
+        prompts = [
+            f"shiny {color} sequin fabric",
+            f"glittery {color} sequins on a model",
+            f"sparkling {color} embellished garment"
+        ]
+        feats = _encode_texts(prompts)
+        scores[color] = float((image_features @ feats.T).max())
+    best_color = max(sequin_colors, key=scores.get)
+    print(f"✨ Sequin color CLIP: {best_color} with scores {scores}")
+    return best_color
+
 def _encode_image(pil_img: Image.Image) -> torch.Tensor:
     """Encode a PIL image → normalized (1, 512) tensor.
 
@@ -391,6 +411,8 @@ CLIP_FABRIC_PROMPTS = {
         "blue denim jeans woven cotton fabric",
         "washed denim jeans product photo",
         "denim jeans on a model",
+        "grey washed denim jeans",
+        "black denim jacket or pants",
     ],
     "jersey": [
         "soft cotton jersey sweatpants joggers",
@@ -417,6 +439,11 @@ CLIP_FABRIC_PROMPTS = {
         "PU leather material clothing",
         "genuine leather fashion item",
     ],
+    "sequin": [
+        "shiny sequin fabric garment",
+        "glittery metallic sequins on clothing",
+        "sparkling embellished party fabric",
+    ]
 }
 
 _fabric_text_features: dict = {}
@@ -630,7 +657,12 @@ def _try_stripe_color(garment_pixels, garment_brightness, brightness_std, catego
     return None
 
 
-def get_fashion_color(pil_img, category_group=None):
+def get_fashion_color(pil_img, category_group=None, fabric=None):
+    # --- מעקף פייטים לטובת זיהוי צבע מבוסס CLIP ---
+    if fabric == "sequin":
+        detected_sequin_color = _detect_sequin_color_clip(pil_img)
+        return detected_sequin_color, False
+    # -----------------------------------------------
     # ── Step 1: centre crop ───────────────────────────────────────────────────
     # Tops/bottoms: middle 70% × central 60% — avoids belt and shoes bleeding in.
     # Shoes: lower 55% — focus on foot/sandal pixels, less skin variance.
@@ -809,7 +841,7 @@ def get_fashion_color(pil_img, category_group=None):
 
     # Light floral / patchwork prints — skip for shoes (straps + skin variance
     # falsely triggers this rule on solid-colour sandals).
-    skip_pattern = category_group == "shoes"
+    skip_pattern = category_group == "shoes" or fabric in ("denim", "leather", "sequin")
     # Top zone crops mix shirt + hair — still allow stripe detection via top-stripe rule above.
     skip_stripe_dark = False
     # Tan leather sandals — warm strap pixels dominate over shadow/floor.
@@ -831,7 +863,7 @@ def get_fashion_color(pil_img, category_group=None):
     # ── Top colour pipeline (single ordered pass) ─────────────────────────────
     if category_group == "top":
         # 1. Stripe — must precede bright-white: white stripe pixels fool _try_bright_white_top.
-        if brightness_std > 24:
+        if brightness_std > 24 and fabric not in ("leather", "sequin"):
             stripe_hit = _try_stripe_color(garment_pixels, garment_brightness, brightness_std, category_group)
             if stripe_hit:
                 return stripe_hit
@@ -1034,9 +1066,13 @@ def get_fashion_color(pil_img, category_group=None):
             white_hit = _try_bright_white_top(garment_pixels, garment_brightness)
             if white_hit:
                 return white_hit
+                
         if r >= g >= b and (r - b) >= 12:
-            print(f"🎨 Detected color: beige (warm-dark-top rule)  avg_rgb=({r:.0f},{g:.0f},{b:.0f})")
-            return "beige", False
+            detected = "brown" if avg_brightness >= 35 else "black"
+            print(f"🎨 Detected color: {detected} (warm-dark rule)  avg_rgb=({r:.0f},{g:.0f},{b:.0f})")
+            return detected, False
+        # ------------------------------------------------------------------------
+        
         result = "navy" if (b > r + 15) else "black"
         print(f"🎨 Detected color: {result} (dark-rule)  avg_rgb=({r:.0f},{g:.0f},{b:.0f})")
         return result, False
@@ -1079,7 +1115,7 @@ def get_fashion_color(pil_img, category_group=None):
     # reference (128,128,128) is much brighter — the distance to olive (85,107,47)
     # is accidentally smaller in RGB space even though olive has 60-point saturation.
     # Warm tan/beige is handled above — only cool neutrals fall through to grey here.
-    if avg_saturation < 20 and not (r >= g >= b and (r - b) >= 8):
+    if avg_saturation < 20 and not (r >= g >= b and (r - b) >= 12):
         print(f"🎨 Detected color: grey (low-sat rule)  avg_rgb=({r:.0f},{g:.0f},{b:.0f})")
         return "grey", False
 
@@ -1168,6 +1204,9 @@ def detect_category_clip(pil_img) -> str:
     if belt_score >= bottom_score + 0.005 and belt_score >= top_score - 0.005:
         if _shorts_with_belt_override(pil_img):
             print("📐 Belt skipped — shorts-with-belt override (garment is bottom/shorts)")
+        elif h > w * 1.2:
+            print("📐 Belt skipped — image is tall, likely trousers/jeans, not a belt")
+        # ------------------------------------------------------------------
         else:
             rounded = {k: round(v, 4) for k, v in sorted(waist_scores.items(), key=lambda x: -x[1])}
             print(f"📐 Category scores (waist-belt): {rounded}  → winner: belt")
@@ -1180,8 +1219,6 @@ def detect_category_clip(pil_img) -> str:
         return "shoes"
 
     if h > w * 0.85:
-        # Portrait: score full body + zones. Upper half of a maxi dress looks like a tank
-        # top — always check full-image dress score before trusting upper-body "top".
         full_scores = _score_categories(pil_img)
         upper_scores = _score_categories(pil_img.crop((0, 0, w, int(h * 0.55))))
         lower_scores = _score_categories(pil_img.crop((0, int(h * 0.42), w, h)))
@@ -1193,14 +1230,13 @@ def detect_category_clip(pil_img) -> str:
             best_cat = "shoes"
             all_scores = lower_scores
             region = "lower-feet"
-        elif (full_scores["dress"] >= full_scores["top"] - 0.015
-              and full_scores["dress"] >= max(
-                  full_scores.get("skirt", 0),
-                  full_scores.get("bottom", 0) - 0.01,
-              )):
+        elif (full_scores["dress"] >= full_scores["top"] - 0.005
+              and full_scores["dress"] >= full_scores.get("bottom", 0) + 0.015
+              and full_scores["dress"] >= full_scores.get("skirt", 0) + 0.015):
             best_cat = "dress"
             all_scores = full_scores
             region = "full-dress"
+        # --------------------------------------------------------------
         elif upper_best == "top" and upper_scores["top"] > upper_scores.get("bottom", 0) + 0.01:
             if full_scores["dress"] < full_scores["top"] - 0.02:
                 best_cat = "top"
@@ -1223,9 +1259,28 @@ def detect_category_clip(pil_img) -> str:
         best_cat = max(all_scores, key=all_scores.get)
         region = "full"
 
-    if best_cat == "belt" and _shorts_with_belt_override(pil_img):
-        best_cat = "bottom"
-        region = "shorts-over-belt"
+    if best_cat == "belt":
+        if _shorts_with_belt_override(pil_img):
+            best_cat = "bottom"
+            region = "shorts-over-belt"
+        elif h > w * 1.2:
+            print("📐 Belt skipped (Manual) — image is tall, likely trousers/jeans")
+            best_cat = "bottom"
+            region = "tall-pants-over-belt"
+        elif detect_fabric_clip(pil_img) == "denim":
+            print("📐 Belt skipped — fabric is denim, must be jeans/bottom")
+            best_cat = "bottom"
+            region = "denim-pants-over-belt"
+            
+    if best_cat == "skirt" and detect_fabric_clip(pil_img) == "leather":
+        top_s = all_scores.get("top", 0.0)
+        skirt_s = all_scores.get("skirt", 0.0)
+        if top_s >= skirt_s - 0.04:
+            print(f"📐 Skirt to Top override — leather fabric with strong top score (top={top_s:.3f}, skirt={skirt_s:.3f})")
+            best_cat = "top"
+            region = "leather-jacket-over-skirt"
+    # -----------------------------------------------------------------
+
     rounded = {k: round(v, 4) for k, v in all_scores.items()}
     scores_str = "  ".join(f"{c}={s}" for c, s in sorted(rounded.items(), key=lambda x: -x[1]))
     print(f"📐 Category scores ({region}): {scores_str}  → winner: {best_cat}")
@@ -1517,8 +1572,10 @@ TOP_STYLE_COLOR_PHRASES = {
         "beige": "beige halter neck top",
     },
     "coat": {
-        "black": "black shiny leather bomber jacket with high collar",
-        "brown": "brown leather coat jacket on a model",
+        "black": "black leather jacket outerwear",
+        "brown": "brown leather jacket outerwear",
+        "grey": "grey leather jacket outerwear",
+        "white": "white leather jacket outerwear",
         "beige": "beige trench coat outerwear",
     },
     "vest": {
@@ -1735,31 +1792,40 @@ def detect_bottom_length_clip(pil_img) -> str:
 
 
 def detect_skirt_length_clip(pil_img) -> tuple:
-    """Classify skirt length: mini vs midi vs maxi.
-
-    Returns (best_length: str, scores: dict) so callers can inspect raw scores
-    for confidence-gated upgrade logic.
-    """
+    """Classify skirt length: mini vs midi vs maxi."""
     image_features = _encode_image(pil_img)
-    best_length = "midi"
-    best_score = -1.0
+    w, h = pil_img.size
+    aspect_ratio = h / w  # חישוב יחס גובה-רוחב
+
     scores = {}
     for length, text_feats in _skirt_length_text_features.items():
         sims = (image_features @ text_feats.T).squeeze(0)
         score = float(sims.max())
         scores[length] = score
-        if score > best_score:
-            best_score = score
-            best_length = length
+
+    # --- שימוש במימדי התמונה לתיקון האורך ---
+    if aspect_ratio < 1.1:
+        # חיתוך רחב או כמעט ריבועי מעיד בסבירות גבוהה מאוד על חצאית קצרה (מיני)
+        scores["mini"] = scores.get("mini", 0.0) + 0.06
+        scores["midi"] = scores.get("midi", 0.0) - 0.03
+        scores["maxi"] = scores.get("maxi", 0.0) - 0.08
+    elif aspect_ratio > 1.8:
+        # חיתוך צר וארוך אנכית מעיד על חצאית ארוכה (מידי/מקסי)
+        scores["maxi"] = scores.get("maxi", 0.0) + 0.03
+        scores["midi"] = scores.get("midi", 0.0) + 0.02
+    # -----------------------------------------
+
+    best_length = max(scores, key=scores.get)
     mini_score = scores.get("mini", 0)
     midi_score = scores.get("midi", 0)
     maxi_score = scores.get("maxi", 0)
-    # Let argmax win; apply a conservative maxi boost only since floor-length garments
-    # are systematically under-scored by CLIP relative to mini/midi prompts.
-    if maxi_score >= midi_score + 0.010 and maxi_score >= mini_score:
+    
+    # הפעלת הבוסט למקסי רק אם האורך הנבחר אינו מיני
+    if best_length != "mini" and maxi_score >= midi_score + 0.010 and maxi_score >= mini_score:
         best_length = "maxi"
+
     rounded = {k: round(v, 3) for k, v in sorted(scores.items(), key=lambda x: -x[1])}
-    print(f"Skirt length: {best_length}  scores: {rounded}")
+    print(f"Skirt length: {best_length}  aspect_ratio: {aspect_ratio:.2f}  scores: {rounded}")
     return best_length, scores
 
 
@@ -1792,10 +1858,20 @@ def get_skirt_length_color_vector(color: str, fabric: str, skirt_length: str) ->
             "midi": "midi skirt below the knee",
             "maxi": "maxi skirt floor length",
         }.get(skirt_length, "skirt")
-        phrase = f"{color.replace('_', ' ')} {length_label}"
+        
+        # --- עדכון: הזרקת מאפיין הטקסטורה (פייטים/עור) לתוך השאילתה המקודדת ---
+        if fabric in ("sequin", "leather"):
+            phrase = f"{color.replace('_', ' ')} {fabric} {length_label}"
+        else:
+            phrase = f"{color.replace('_', ' ')} {length_label}"
+        # ---------------------------------------------------------------------
+    else:
+        # אם יש משפט מובנה, נעדכן אותו לכלול פייטים במידת הצורך
+        if fabric == "sequin":
+            phrase = phrase.replace("skirt", "sequin skirt")
+            
     feats = _encode_texts([phrase])
     return feats.cpu().numpy().flatten().tolist()
-
 
 def get_skirt_length_contrast_vector(skirt_length: str) -> list:
     wrong_phrases = {
@@ -1949,7 +2025,7 @@ def get_color_vector(color: str) -> list:
 
 
 def detect_fabric_clip(pil_img) -> str:
-    """Zero-shot fabric detection → denim | jersey | knit | woven | linen | leather | other."""
+    """Zero-shot fabric detection → denim | jersey | knit | woven | linen | leather | sequin | other."""
     image_features = _encode_image(pil_img)
     best_fab = "other"
     best_score = -1.0
@@ -1959,9 +2035,16 @@ def detect_fabric_clip(pil_img) -> str:
         if score > best_score:
             best_score = score
             best_fab = fab
+            
     print(f"🧵 Fabric: {best_fab} (score={best_score:.4f})")
+    
+    # 🛑 --- התיקון כאן: לתת אישור לפייטים גם בציון קצת יותר נמוך --- 🛑
+    if best_fab == "sequin" and best_score >= 0.22:
+        return best_fab
+        
     if best_score < 0.26:
         return "woven"
+        
     return best_fab
 
 
@@ -2454,7 +2537,26 @@ def _analyze_garment_crop(
     """Run full CLIP pipeline on one crop and return a Total Look item dict."""
     category_group = force_category or detect_category_clip(crop_img)
     fabric = detect_fabric_clip(crop_img)
-    color, is_stripe = get_fashion_color(crop_img, category_group)
+
+    # 🛑 --- חומת המגן נגד נעלי רפאים: חייבת להיות בדיוק כאן! --- 🛑
+    if category_group == "shoes":
+        if fabric == "sequin":
+            print(f"⏭ Dropped fake shoe (source={source}) — detected sequin fabric (skirt hem)")
+            return None
+            
+        skin_frac, dark_frac = _foot_skin_and_dark(crop_img)
+        if skin_frac > 0.40 and dark_frac < 0.05:
+            print(f"⏭ Dropped fake shoe (source={source}) — mostly bare skin ({skin_frac:.2f} skin)")
+            return None
+            
+        if source == "yolo":
+            shoe_clip_score = _score_categories(crop_img).get("shoes", 0.0)
+            if shoe_clip_score < 0.17:
+                print(f"⏭ Dropped fake YOLO shoe — CLIP shoe score too low ({shoe_clip_score:.3f})")
+                return None
+    # 🛑 -------------------------------------------------------- 🛑
+            
+    color, is_stripe = get_fashion_color(crop_img, category_group, fabric)
     if fabric == "denim" and category_group == "top" and color == "white":
         color, is_stripe = "light_blue", False
     elif fabric == "denim" and category_group == "bottom" and color == "white":
@@ -2518,7 +2620,7 @@ def _analyze_garment_crop(
             if float((br > 175).sum()) / len(br) >= 0.07:
                 color = "white"
                 fabric = "jersey"
-        if fabric == "leather" and color in ("black", "brown", "burgundy"):
+        if fabric == "leather" and color in ("black", "brown", "burgundy", "grey"):
             color = "black"
         if fabric == "denim" and color in ("white", "grey"):
             color = "light_blue"
@@ -2593,9 +2695,18 @@ def _analyze_garment_crop(
         return None
     confidence = max(yolo_conf, cat_score)
 
+    final_category = get_category_group(yolo_label) if yolo_label else category_group
+    if category_group == "top" and top_style == "coat":
+        if fabric == "leather":
+            final_category = "leather_jacket"
+        else:
+            final_category = "jacket"
+    elif category_group == "top" and top_style == "shirt":
+        final_category = "shirt"
+
     item = {
         "slotId": slot_id,
-        "category": get_category_group(yolo_label) if yolo_label else category_group,
+        "category": final_category, 
         "categoryGroup": category_group,
         "fabricGroup": fabric,
         "confidence": round(confidence, 4),
@@ -2718,6 +2829,7 @@ _ZONE_FORCE_CATEGORY = {
     "top": "top",
     "belt": "belt",
     "bottom": "bottom",
+    "lower_bottom": "bottom",
     "shoes": "shoes",
 }
 
@@ -2785,10 +2897,6 @@ def _zone_garment_candidates(
     if rw < 8 or rh < 8:
         return []
 
-    # Paint detected bags/backpacks out of the image before cropping zones.
-    # The fill colour (245,245,245) is above the bright-background threshold
-    # in get_fashion_color, so painted pixels are excluded from garment colour
-    # statistics — they never inflate dark_frac or distort avg_brightness.
     base_img = _paint_out_boxes(img, bag_boxes or [])
 
     candidates = []
@@ -2801,7 +2909,21 @@ def _zone_garment_candidates(
         ]
         crop = base_img.crop(tuple(bbox))
         scores = _score_categories(crop)
-        if zone_name == "belt":
+        
+        if zone_name == "shoes":
+            shoe_s = scores.get("shoes", 0.0)
+            rival_s = max(scores.get("bottom", 0.0), scores.get("skirt", 0.0))
+            
+            if rival_s > shoe_s + 0.01 or shoe_s < 0.17:
+                print(f"⏭ Shoes zone skipped — looks like legs/skirt hem (shoe={shoe_s:.3f}, rival={rival_s:.3f})")
+                continue
+                
+            skin_frac, dark_frac = _foot_skin_and_dark(crop)
+            if skin_frac > 0.45 and dark_frac < 0.05 and shoe_s < 0.25:
+                print("⏭ Shoes zone skipped — mostly bare skin / background detected")
+                continue
+        # --------------------------------------------------------
+        elif zone_name == "belt":
             belt_s = scores.get("belt", 0)
             bottom_s = scores.get("bottom", 0)
             if belt_s < 0.24 or belt_s < bottom_s + 0.04:
@@ -2811,15 +2933,16 @@ def _zone_garment_candidates(
         elif zone_name == "bottom":
             if max(scores.get("skirt", 0), scores.get("bottom", 0)) < 0.17:
                 continue
+        elif zone_name == "lower_bottom":
+            if scores.get("bottom", 0) < 0.17:
+                continue
         elif max(scores.values()) < 0.21:
             continue
+            
         forced = _resolve_zone_force_category(zone_name, scores, crop)
         if not forced:
             continue
-        # For the bottom/skirt zone, pass a taller crop (44%→95%) as a length
-        # hint so detect_skirt_length_clip sees the full length of long skirts.
-        # The standard zone crop stops at 76%, cutting off ankle-length skirts
-        # and causing them to be mis-labelled as mini.
+
         length_hint = None
         if zone_name == "bottom":
             tall_bbox = [
@@ -2848,13 +2971,17 @@ def _finalize_total_look_slots(by_slot: dict) -> list:
     shoes = by_slot.get("shoes")
     bottom_item = shorts or bottom
 
+    if top and skirt:
+        if top.get("fabricGroup") == "leather" and skirt.get("fabricGroup") == "leather":
+            if top.get("color") == skirt.get("color"):
+                print("👗 Look archetype: Long leather coat spilling into bottom zone -> Dropping fake skirt")
+                del by_slot["skirt"]
+                skirt = None
+    # ---------------------------------------------------
+
     if top and shorts and shoes and not skirt and not belt:
         print("👗 Look archetype: top + shorts + shoes")
         return [top, shorts, shoes]
-
-    if top and skirt and shoes and not belt and not bottom_item:
-        print("👗 Look archetype: top + skirt + shoes")
-        return [top, skirt, shoes]
 
     if top and belt and skirt and belt["confidence"] >= 0.17:
         items = [top, belt, skirt]
@@ -2961,7 +3088,7 @@ def process_image_logic(img):
 
         category_group = detect_category_clip(img)
         fabric = detect_fabric_clip(img)
-        color, is_stripe = get_fashion_color(img, category_group)
+        color, is_stripe = get_fashion_color(crop_img, category_group, fabric)
         shoe_style = detect_shoe_style_clip(img) if category_group == "shoes" else None
         top_style = detect_top_style_clip(img) if category_group == "top" else None
         bottom_length = detect_bottom_length_clip(img) if category_group == "bottom" else None
@@ -2996,7 +3123,7 @@ def process_image_logic(img):
 
                     category_group = detect_category_clip(crop_img)
                     fabric = detect_fabric_clip(crop_img)
-                    color, is_stripe = get_fashion_color(crop_img, category_group)
+                    color, is_stripe = get_fashion_color(crop_img, category_group, fabric)
                     shoe_style = detect_shoe_style_clip(crop_img) if category_group == "shoes" else None
                     top_style = detect_top_style_clip(crop_img) if category_group == "top" else None
                     bottom_length = detect_bottom_length_clip(crop_img) if category_group == "bottom" else None
@@ -3031,8 +3158,11 @@ async def process_url(data: URLRequest):
         image_features = _encode_image(img)
         embedding = image_features.cpu().numpy().flatten().tolist()
 
-        color, _ = get_fashion_color(img)
+        # --- התיקון כאן: שינוי סדר ושליחת הפרמטרים המלאים ---
         category_group = detect_category_clip(img)
+        fabric = detect_fabric_clip(img)
+        color, _ = get_fashion_color(img, category_group, fabric)
+        # --------------------------------------------------
 
         return {"items": [{
             "embedding": embedding,
@@ -3052,7 +3182,13 @@ async def extract_color_from_url(data: URLRequest):
         response = requests.get(data.image_url, headers=HEADERS, timeout=15)
         response.raise_for_status()
         img = Image.open(io.BytesIO(response.content)).convert("RGB")
-        detected_color, _ = get_fashion_color(img)
+        
+        # --- התיקון כאן: הוספת זיהוי בד וקטגוריה לפני חישוב הצבע ---
+        category_group = detect_category_clip(img)
+        fabric = detect_fabric_clip(img)
+        detected_color, _ = get_fashion_color(img, category_group, fabric)
+        # --------------------------------------------------------
+        
         return {"color": detected_color}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

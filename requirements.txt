@@ -6,3 +6,4 @@ Pillow
 python-multipart
 transformers
 git+https://github.com/openai/CLIP.git
+mediapipe==0.10.14

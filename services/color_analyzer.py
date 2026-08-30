@@ -390,38 +390,40 @@ def get_fashion_color(pil_img: Image.Image, category_group: Optional[str] = None
     # ── Step 1: Centre Crop ───────────────────────────────────────────────────
     # Tops/bottoms: middle 70% × central 60% — avoids belt and shoes bleeding in.
     # Shoes: lower 55% — focus on foot/sandal pixels, less skin variance.
+# ── Step 1: Centre Crop ───────────────────────────────────────────────────
     w, h = pil_img.size
     cx0, cx1 = int(w * 0.15), int(w * 0.85)
     
     if category_group == "top":
         # Narrow the X-axis for tops to strictly hit the chest, avoiding armpits/background
-        cx0, cx1 = int(w * 0.30), int(w * 0.72) 
-        
-        # Zone crops are short horizontal bands — use most of the band so stripes aren't clipped away.
+        cx0, cx1 = int(w * 0.30), int(w * 0.70) 
         if h < w * 0.55:
             cy0, cy1 = int(h * 0.22), int(h * 0.92)
         else:
             # Catch strapless (chest) and crop tops (midriff), but avoid neck (0-20%) and pants (65-100%)
             cy0, cy1 = int(h * 0.22), int(h * 0.50)
-        
-    if category_group == "shoes":
+            
+    elif category_group == "shoes":
+        # Focus on foot/sandal pixels, less skin variance.
         if h <= w * 1.3:
             cy0, cy1 = int(h * 0.35), int(h * 0.98)
         else:
             cy0, cy1 = int(h * 0.55), int(h * 0.95)
-    elif category_group == "top":
-        # Zone crops are short horizontal bands — use most of the band so stripes aren't clipped away.
-        if h < w * 0.55:
-            cy0, cy1 = int(h * 0.22), int(h * 0.92)
-        else:
-            # Tall person bbox — upper chest only; skip waist/dark pants at bottom of crop.
-            cy0, cy1 = int(h * 0.22), int(h * 0.65)
+            
     elif category_group == "belt":
         # Thin waist band — centre strip only, skip shorts above/below.
         cx0, cx1 = int(w * 0.18), int(w * 0.82)
         cy0, cy1 = int(h * 0.30), int(h * 0.70)
+        
     elif category_group == "skirt":
+        # Skirts need the full length to detect patterns/polka dots accurately
         cy0, cy1 = int(h * 0.08), int(h * 0.88)
+        
+    elif category_group in ("bottom", "shorts"):
+        # Pants/Shorts: Sample the upper thighs/pelvis to avoid knees and chairs when seated!
+        cx0, cx1 = int(w * 0.25), int(w * 0.75)
+        cy0, cy1 = int(h * 0.05), int(h * 0.40)
+        
     else:
         cy0, cy1 = int(h * 0.20), int(h * 0.80)
         

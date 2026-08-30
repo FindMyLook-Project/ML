@@ -1,36 +1,50 @@
-# ML
-# FindMyLook - ML Service 🚀
+# FIND MY LOOK - Machine Learning Service
 
-שירות ה-ML (Machine Learning) של פרויקט FindMyLook. 
-[cite_start]השירות מבוסס Python ו-FastAPI ותפקידו לנתח תמונות "לוק" המועלות על ידי המשתמש, לזהות פריטי לבוש (Detection) ולהפיק וקטורים (Embeddings) לחיפוש ויזואלי בבסיס הנתונים[cite: 23, 38].
+Welcome to the Machine Learning repository for **FIND MY LOOK**. 
+This Python-based service acts as the computer vision and AI analysis engine for the application. It processes uploaded images to detect garments, classify features, extract fashion-specific colors, and generate semantic vectors (embeddings) for similarity search.
 
-## 🛠 טכנולוגיות בשימוש
-- [cite_start]**FastAPI**: שרת ה-API של השירות.
-- [cite_start]**YOLOv8 (Ultralytics)**: מודל לזיהוי אובייקטים (Object Detection)[cite: 127].
-- [cite_start]**CLIP / Sentence-Transformers**: מודל להפקת ייצוגים ויזואליים (Image Embeddings)[cite: 129].
-- **Pillow (PIL)**: ספריית עיבוד תמונות לגזירה ועיבוד מקדים.
+## Note for the Evaluator
+This service is designed to run asynchronously alongside the **Backend (Node.js)** and **Frontend (React)**. To evaluate the full system flow, please ensure this FastAPI server is running. It handles both single-item crops and full-body "Total Look" pose estimations.
 
-## 🚀 הוראות הקמה (Setup)
+## Tech Stack & Models
+* **FastAPI:** High-performance API framework serving the ML endpoints.
+* **YOLOv8 (Ultralytics):** Real-time object detection model fine-tuned for garment bounding boxes.
+* **MediaPipe:** Anatomical pose estimation used to dynamically calculate body zones (shoulders, hips, knees) for full-body outfit mapping.
+* **OpenAI CLIP (fashion-clip):** Zero-shot classification and image/text embedding model used to generate semantic vectors and classify complex styles (e.g., fabric types, skirt lengths).
+* **OpenCV & Pillow:** Image processing and pixel-level color analysis.
 
-לפני תחילת העבודה, ודאי שמותקן אצלך Python 3.8 ומעלה.
+## Installation & Setup
 
-### 1. שכפול המאגר (Clone)
+Ensure you have **Python 3.8+** installed on your machine.
+
+**1. Clone the Repository**
 ```bash
-git clone <repository_url>
-cd ML
-# יצירת הסביבה
+git clone [https://github.com/FindMyLook-Project/ml-service.git](https://github.com/FindMyLook-Project/ml-service.git)
+cd ml-service
+
+2. Create a Virtual Environment:
 python -m venv venv
-# הפעלה (Windows - Git Bash)
-source venv/Scripts/activate
-# הפעלה (Windows - PowerShell)
-.\venv\Scripts\activate
+
+3. Activate the Virtual Environment
+Windows (PowerShell): .\venv\Scripts\activate
+Windows (Git Bash): source venv/Scripts/activate
+macOS/Linux: source venv/bin/activate
+
+4. Install Dependencies
 pip install -r requirements.txt
 
-python main.py הרצה
+5. Run the ML Server
+python main.py
 
-📂 מבנה הפרויקט המומלץ
+The server will start on http://localhost:8000.
+(Note: The first run may take a few minutes as it downloads the fashion-clip model weights from HuggingFace).
 
-main.py: נקודת הכניסה לשירות והגדרת ה-Endpoints.
-models/: תיקייה לאחסון קבצי ה-Weights של המודלים (קבצי .pt).
-requirements.txt: רשימת הספריות להתקנה.
-venv/: סביבה וירטואלית (נמצא ב-.gitignore).
+-----------------------------------------------------------------------
+Key Architectural Components
+- Anatomical Pose Estimation (pose_estimator.py): Replaces static image crops with dynamic bounding boxes based on human joints, ensuring accurate "Total Look" detection even when the user is not perfectly centered.
+
+- Zero-Shot Classification (garment_classifier.py): Leverages CLIP's semantic understanding to classify attributes that are difficult for traditional models (e.g., distinguishing a denim shirt from a denim vest, or a mini skirt from a maxi skirt).
+
+- Smart Color Taxonomy (color_analyzer.py): Combines pixel-level analysis (masking skin, floor, and background) with CLIP fallbacks to accurately identify complex patterns, stripes, and subtle fashion hues (like lavender or beige).
+
+- Vector Builder (vector_builder.py): Translates detected visual features into 512-dimensional text vectors, allowing the Node.js backend to perform highly accurate semantic searches against the MongoDB database.

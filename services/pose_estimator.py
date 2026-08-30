@@ -104,17 +104,18 @@ def extract_anatomical_zones(pil_img: Image.Image) -> Dict[str, Tuple[int, int, 
     
     zones = {}
     
-    # --- Top Zone (Shoulders to slightly below Hips) ---
+# --- Top Zone (Shoulders to slightly below Hips) ---
     if shoulders_y is not None and hips_y is not None:
-        top_y0 = max(0, shoulders_y - int(h * 0.05)) # Little above shoulders for collar
-        top_y1 = min(h, hips_y + int(h * 0.08))      # Slightly below hips for shirt hem
-        top_x0, top_x1 = _get_landmark_x_bounds(landmarks, [11, 12, 13, 14, 23, 24], w, padding_ratio=0.12)
+        top_x0, top_x1 = _get_landmark_x_bounds(landmarks, [11, 12, 23, 24], w, padding_ratio=0.08)
+        top_y0 = max(0, shoulders_y - int(h * 0.05))
+        top_y1 = min(h, hips_y + int(h * 0.08))
         zones["top"] = (top_x0, top_y0, top_x1, top_y1)
         
     # --- Bottom Zone (Waist to Ankles/Knees) ---
     if hips_y is not None:
+        bottom_x0, bottom_x1 = _get_landmark_x_bounds(landmarks, [23, 24, 25, 26], w, padding_ratio=0.05)
         bottom_y0 = max(0, hips_y - int(h * 0.02))
-        # If ankles are visible, go down to them. Otherwise, default to knees or bottom of image
+        
         if ankles_y is not None:
             bottom_y1 = min(h, ankles_y)
         elif knees_y is not None:
@@ -122,7 +123,6 @@ def extract_anatomical_zones(pil_img: Image.Image) -> Dict[str, Tuple[int, int, 
         else:
             bottom_y1 = int(h * 0.95)
             
-        bottom_x0, bottom_x1 = _get_landmark_x_bounds(landmarks, [23, 24, 25, 26, 27, 28], w, padding_ratio=0.08)
         zones["bottom"] = (bottom_x0, bottom_y0, bottom_x1, bottom_y1)
         
     # --- Shoes Zone (Ankles to Bottom of Feet) ---
